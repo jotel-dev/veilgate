@@ -1,0 +1,17 @@
+# Rust build output
+target/
+
+# Secrets and config
+.env
+.env.*
+
+# Wallet data and keys: never commit these
+*.db
+*.sqlite
+*.sqlite3
+*.seed
+*.key
+
+# Node and misc
+node_modules/
+.DS_Store
