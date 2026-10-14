@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros"] }
+tonic = { version = "0.14.6", features = ["tls-ring", "tls-webpki-roots", "transport"] }
+zcash_client_backend = { version = "0.24.0", features = ["lightwalletd-tonic-transport", "lightwalletd-tonic-tls-webpki-roots"] }
