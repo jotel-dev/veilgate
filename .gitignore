@@ -11,6 +11,7 @@ target/
 *.sqlite3
 *.seed
 *.key
+.veilgate/
 
 # Node and misc
 node_modules/
