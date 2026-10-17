@@ -69,6 +69,8 @@ pub struct Invoice {
     pub expires_at: u64,
     /// Dynamic status evaluated at read time (Pending, Paid, or Expired).
     pub status: InvoiceStatus,
+    /// Flag indicating whether the invoice was marked paid after its expiration.
+    pub is_late: bool,
 }
 
 impl Invoice {
@@ -126,9 +128,29 @@ pub fn open_store(path: impl AsRef<Path>) -> Result<Store> {
             address TEXT NOT NULL,
             created_at INTEGER NOT NULL,
             expires_at INTEGER NOT NULL,
-            status TEXT NOT NULL
-         );",
+            status TEXT NOT NULL,
+            is_late INTEGER NOT NULL DEFAULT 0
+         );
+
+         CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            address_index INTEGER NOT NULL,
+            txid TEXT NOT NULL,
+            output_index INTEGER NOT NULL,
+            pool TEXT NOT NULL,
+            value_zatoshi INTEGER NOT NULL,
+            block_height INTEGER NOT NULL,
+            block_hash TEXT NOT NULL,
+            UNIQUE(txid, output_index, pool),
+            FOREIGN KEY(address_index) REFERENCES invoices(address_index)
+         );
+
+         CREATE INDEX IF NOT EXISTS idx_payments_address_index ON payments(address_index);
+         CREATE INDEX IF NOT EXISTS idx_payments_block_height ON payments(block_height);",
     )?;
+
+    // Ensure is_late column exists in existing databases
+    let _ = conn.execute("ALTER TABLE invoices ADD COLUMN is_late INTEGER NOT NULL DEFAULT 0", []);
 
     // Monotonic index setup:
     // Determine the next index, ensuring it never goes below FIRST_INVOICE_INDEX (2)
@@ -230,8 +252,8 @@ pub fn create_invoice(
 
     tx.execute(
         "INSERT INTO invoices (
-            address_index, public_id, amount_zatoshi, address, created_at, expires_at, status
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')",
+            address_index, public_id, amount_zatoshi, address, created_at, expires_at, status, is_late
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0)",
         params![
             allocated_index,
             public_id,
@@ -258,6 +280,7 @@ pub fn create_invoice(
         created_at,
         expires_at,
         status,
+        is_late: false,
     })
 }
 
@@ -271,7 +294,7 @@ pub fn get_by_public_id(store: &Store, id: &str) -> Result<Option<Invoice>> {
         .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
 
     let mut stmt = conn.prepare(
-        "SELECT address_index, public_id, amount_zatoshi, address, created_at, expires_at, status
+        "SELECT address_index, public_id, amount_zatoshi, address, created_at, expires_at, status, is_late
          FROM invoices WHERE public_id = ?1",
     )?;
 
@@ -284,6 +307,7 @@ pub fn get_by_public_id(store: &Store, id: &str) -> Result<Option<Invoice>> {
         let created_i64: i64 = row.get(4)?;
         let expires_i64: i64 = row.get(5)?;
         let db_status: String = row.get(6)?;
+        let is_late_i64: i64 = row.get(7).unwrap_or(0);
 
         let amount_zatoshi = u64::try_from(amount_i64)
             .map_err(|e| anyhow!("Negative amount in database: {e}"))?;
@@ -307,6 +331,7 @@ pub fn get_by_public_id(store: &Store, id: &str) -> Result<Option<Invoice>> {
             created_at,
             expires_at,
             status,
+            is_late: is_late_i64 != 0,
         }))
     } else {
         Ok(None)
@@ -323,7 +348,7 @@ pub fn list_invoices(store: &Store) -> Result<Vec<Invoice>> {
         .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
 
     let mut stmt = conn.prepare(
-        "SELECT address_index, public_id, amount_zatoshi, address, created_at, expires_at, status
+        "SELECT address_index, public_id, amount_zatoshi, address, created_at, expires_at, status, is_late
          FROM invoices ORDER BY address_index ASC",
     )?;
 
@@ -340,6 +365,7 @@ pub fn list_invoices(store: &Store) -> Result<Vec<Invoice>> {
         let created_i64: i64 = row.get(4)?;
         let expires_i64: i64 = row.get(5)?;
         let db_status: String = row.get(6)?;
+        let is_late_i64: i64 = row.get(7).unwrap_or(0);
 
         let amount_zatoshi = u64::try_from(amount_i64)
             .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Integer, Box::new(e)))?;
@@ -358,6 +384,7 @@ pub fn list_invoices(store: &Store) -> Result<Vec<Invoice>> {
             created_at,
             expires_at,
             status,
+            is_late: is_late_i64 != 0,
         })
     })?;
 
@@ -376,7 +403,267 @@ pub fn mark_paid(store: &Store, public_id: &str) -> Result<bool> {
     store.mark_paid(public_id)
 }
 
+/// A record of a detected shielded payment output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaymentRecord {
+    pub address_index: u32,
+    pub txid: String,
+    pub output_index: u32,
+    pub pool: String,
+    pub value_zatoshi: u64,
+    pub block_height: u64,
+    pub block_hash: String,
+}
+
+/// Summary of all payments and confirmation status for an invoice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaymentSummary {
+    pub address_index: u32,
+    pub amount_zatoshi: u64,
+    pub total_detected_zatoshi: u64,
+    pub total_confirmed_zatoshi: u64,
+    pub excess_zatoshi: u64,
+    pub is_paid: bool,
+    pub is_late: bool,
+    pub payments: Vec<PaymentRecord>,
+}
+
+/// Retrieves an invoice by its internal address index.
+pub fn get_by_address_index(store: &Store, index: u32) -> Result<Option<Invoice>> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
+
+    let mut stmt = conn.prepare(
+        "SELECT address_index, public_id, amount_zatoshi, address, created_at, expires_at, status, is_late
+         FROM invoices WHERE address_index = ?1",
+    )?;
+
+    let mut rows = stmt.query([index])?;
+    if let Some(row) = rows.next()? {
+        let address_index: u32 = row.get(0)?;
+        let public_id: String = row.get(1)?;
+        let amount_i64: i64 = row.get(2)?;
+        let address: String = row.get(3)?;
+        let created_i64: i64 = row.get(4)?;
+        let expires_i64: i64 = row.get(5)?;
+        let db_status: String = row.get(6)?;
+        let is_late_i64: i64 = row.get(7).unwrap_or(0);
+
+        let amount_zatoshi = u64::try_from(amount_i64)
+            .map_err(|e| anyhow!("Negative amount in database: {e}"))?;
+        let created_at = u64::try_from(created_i64)
+            .map_err(|e| anyhow!("Negative created_at in database: {e}"))?;
+        let expires_at = u64::try_from(expires_i64)
+            .map_err(|e| anyhow!("Negative expires_at in database: {e}"))?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let status = evaluate_status(&db_status, expires_at, now);
+
+        Ok(Some(Invoice {
+            address_index,
+            public_id,
+            amount_zatoshi,
+            address,
+            created_at,
+            expires_at,
+            status,
+            is_late: is_late_i64 != 0,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Marks an invoice as paid by address index, specifying whether the payment was confirmed late.
+pub fn mark_paid_by_index(store: &Store, address_index: u32, is_late: bool) -> Result<bool> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
+    let rows = conn.execute(
+        "UPDATE invoices SET status = 'paid', is_late = ?1 WHERE address_index = ?2",
+        params![if is_late { 1i64 } else { 0i64 }, address_index],
+    )?;
+    Ok(rows > 0)
+}
+
+/// Retrieves all payment records stored for a given invoice.
+pub fn get_payments_for_invoice(store: &Store, address_index: u32) -> Result<Vec<PaymentRecord>> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
+
+    let mut stmt = conn.prepare(
+        "SELECT address_index, txid, output_index, pool, value_zatoshi, block_height, block_hash
+         FROM payments WHERE address_index = ?1 ORDER BY block_height ASC, output_index ASC",
+    )?;
+
+    let rows = stmt.query_map([address_index], |row| {
+        let address_index: u32 = row.get(0)?;
+        let txid: String = row.get(1)?;
+        let output_index: u32 = row.get(2)?;
+        let pool: String = row.get(3)?;
+        let val_i64: i64 = row.get(4)?;
+        let height_i64: i64 = row.get(5)?;
+        let block_hash: String = row.get(6)?;
+
+        Ok(PaymentRecord {
+            address_index,
+            txid,
+            output_index,
+            pool,
+            value_zatoshi: val_i64 as u64,
+            block_height: height_i64 as u64,
+            block_hash,
+        })
+    })?;
+
+    let mut payments = Vec::new();
+    for p in rows {
+        payments.push(p?);
+    }
+    Ok(payments)
+}
+
+/// Computes a payment summary for an invoice given current chain tip and required confirmation count.
+pub fn get_payment_summary(
+    store: &Store,
+    address_index: u32,
+    tip_height: u64,
+    confirmations: u32,
+) -> Result<Option<PaymentSummary>> {
+    let inv = match get_by_address_index(store, address_index)? {
+        Some(i) => i,
+        None => return Ok(None),
+    };
+
+    let payments = get_payments_for_invoice(store, address_index)?;
+
+    let mut total_detected_zatoshi: u64 = 0;
+    let mut total_confirmed_zatoshi: u64 = 0;
+
+    for p in &payments {
+        total_detected_zatoshi = total_detected_zatoshi.saturating_add(p.value_zatoshi);
+        let confs = if tip_height >= p.block_height {
+            tip_height - p.block_height + 1
+        } else {
+            0
+        };
+        if confs >= confirmations as u64 {
+            total_confirmed_zatoshi = total_confirmed_zatoshi.saturating_add(p.value_zatoshi);
+        }
+    }
+
+    let excess_zatoshi = total_confirmed_zatoshi.saturating_sub(inv.amount_zatoshi);
+    let is_paid = inv.status == InvoiceStatus::Paid;
+
+    Ok(Some(PaymentSummary {
+        address_index,
+        amount_zatoshi: inv.amount_zatoshi,
+        total_detected_zatoshi,
+        total_confirmed_zatoshi,
+        excess_zatoshi,
+        is_paid,
+        is_late: inv.is_late,
+        payments,
+    }))
+}
+
+/// Retrieves the last scanned block height from invoice_meta.
+pub fn get_last_scanned_height(store: &Store) -> Result<Option<u64>> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
+    let val: Option<i64> = conn
+        .query_row(
+            "SELECT value FROM invoice_meta WHERE key = 'last_scanned_height'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(val.map(|v| v as u64))
+}
+
+/// Stores the last scanned block height in invoice_meta.
+pub fn set_last_scanned_height(store: &Store, height: u64) -> Result<()> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
+    conn.execute(
+        "INSERT INTO invoice_meta (key, value) VALUES ('last_scanned_height', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [height as i64],
+    )?;
+    Ok(())
+}
+
+/// Deletes all payments at or above the given block height (used during chain reorganization).
+/// Automatically reverts any invoices marked paid whose remaining confirmed payments fall below amount_zatoshi.
+pub fn delete_payments_from_height(store: &Store, height: u64) -> Result<usize> {
+    let mut conn = store
+        .conn
+        .lock()
+        .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
+    let tx = conn.transaction()?;
+
+    let affected_indices: Vec<u32> = {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT address_index FROM payments WHERE block_height >= ?1",
+        )?;
+        let rows = stmt
+            .query_map([height as i64], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+
+    let deleted = tx.execute(
+        "DELETE FROM payments WHERE block_height >= ?1",
+        [height as i64],
+    )?;
+
+    // For any affected invoice, re-check whether remaining payments still suffice
+    for idx in affected_indices {
+        let (amount_i64, status): (i64, String) = tx.query_row(
+            "SELECT amount_zatoshi, status FROM invoices WHERE address_index = ?1",
+            [idx],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let amount_zatoshi = amount_i64 as u64;
+
+        if status == "paid" {
+            let remaining: i64 = tx.query_row(
+                "SELECT COALESCE(SUM(value_zatoshi), 0) FROM payments WHERE address_index = ?1",
+                [idx],
+                |row| row.get(0),
+            )?;
+            if (remaining as u64) < amount_zatoshi {
+                tx.execute(
+                    "UPDATE invoices SET status = 'pending', is_late = 0 WHERE address_index = ?1",
+                    [idx],
+                )?;
+            }
+        }
+    }
+
+    tx.commit()?;
+    Ok(deleted)
+}
+
 impl Store {
+    /// Returns reference to internal mutex-guarded SQLite connection.
+    pub fn conn(&self) -> &Mutex<Connection> {
+        &self.conn
+    }
+
     /// Marks an invoice as paid by its public ID.
     pub fn mark_paid(&self, public_id: &str) -> Result<bool> {
         let conn = self
@@ -406,9 +693,49 @@ impl Store {
         get_by_public_id(self, id)
     }
 
+    /// Retrieves an invoice by address index within this store.
+    pub fn get_by_address_index(&self, index: u32) -> Result<Option<Invoice>> {
+        get_by_address_index(self, index)
+    }
+
+    /// Marks an invoice as paid by address index.
+    pub fn mark_paid_by_index(&self, address_index: u32, is_late: bool) -> Result<bool> {
+        mark_paid_by_index(self, address_index, is_late)
+    }
+
     /// Lists all invoices in this store.
     pub fn list_invoices(&self) -> Result<Vec<Invoice>> {
         list_invoices(self)
+    }
+
+    /// Retrieves all payments for an invoice.
+    pub fn get_payments_for_invoice(&self, address_index: u32) -> Result<Vec<PaymentRecord>> {
+        get_payments_for_invoice(self, address_index)
+    }
+
+    /// Gets payment summary for an invoice.
+    pub fn get_payment_summary(
+        &self,
+        address_index: u32,
+        tip_height: u64,
+        confirmations: u32,
+    ) -> Result<Option<PaymentSummary>> {
+        get_payment_summary(self, address_index, tip_height, confirmations)
+    }
+
+    /// Gets last scanned block height.
+    pub fn get_last_scanned_height(&self) -> Result<Option<u64>> {
+        get_last_scanned_height(self)
+    }
+
+    /// Sets last scanned block height.
+    pub fn set_last_scanned_height(&self, height: u64) -> Result<()> {
+        set_last_scanned_height(self, height)
+    }
+
+    /// Rolls back payments from the given block height.
+    pub fn delete_payments_from_height(&self, height: u64) -> Result<usize> {
+        delete_payments_from_height(self, height)
     }
 }
 
