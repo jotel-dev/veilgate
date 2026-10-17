@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use rusqlite::params;
@@ -33,6 +32,7 @@ pub struct DetectedNote {
     pub address_index: u32,
     pub block_height: u64,
     pub block_hash: String,
+    pub block_time: u32,
 }
 
 /// Statistics returned by `apply_detected`.
@@ -88,6 +88,7 @@ pub fn scan_compact_block<P: Parameters + Send + 'static>(
 ) -> Result<(Vec<DetectedNote>, BlockMetadata)> {
     let height = block.height;
     let block_hash = hex_encode(&block.hash);
+    let block_time = block.time;
 
     let scanned = scan_block(
         params,
@@ -117,6 +118,7 @@ pub fn scan_compact_block<P: Parameters + Send + 'static>(
                             address_index,
                             block_height: height,
                             block_hash: block_hash.clone(),
+                            block_time,
                         });
                     }
                 }
@@ -137,6 +139,7 @@ pub fn scan_compact_block<P: Parameters + Send + 'static>(
                             address_index,
                             block_height: height,
                             block_hash: block_hash.clone(),
+                            block_time,
                         });
                     }
                 }
@@ -154,7 +157,7 @@ pub fn scan_compact_block<P: Parameters + Send + 'static>(
 /// - Stores notes in `payments` table with `UNIQUE(txid, output_index, pool)`.
 /// - Marks an invoice as `Paid` only when sum of confirmed payments (`tip_height - block_height + 1 >= confirmations`) >= `amount_zatoshi`.
 /// - Overpayments and partial payments are recorded.
-/// - If marked Paid after `expires_at`, sets `is_late = true`.
+/// - An invoice is marked late if the payment that brings confirmed sum to >= amount was mined after `expires_at`.
 pub fn apply_detected(
     store: &Store,
     notes: &[DetectedNote],
@@ -190,8 +193,8 @@ pub fn apply_detected(
 
         let rows_affected = tx.execute(
             "INSERT INTO payments (
-                address_index, txid, output_index, pool, value_zatoshi, block_height, block_hash
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                address_index, txid, output_index, pool, value_zatoshi, block_height, block_hash, block_time
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(txid, output_index, pool) DO NOTHING",
             params![
                 note.address_index,
@@ -201,6 +204,7 @@ pub fn apply_detected(
                 note.value_zatoshi as i64,
                 note.block_height as i64,
                 note.block_hash,
+                note.block_time as i64,
             ],
         )?;
 
@@ -225,11 +229,6 @@ pub fn apply_detected(
         }
     }
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
     let mut invoices_paid = 0;
 
     // 3. Evaluate invoices for payment completion
@@ -249,30 +248,45 @@ pub fn apply_detected(
 
         let payment_rows = {
             let mut stmt = tx.prepare(
-                "SELECT value_zatoshi, block_height FROM payments WHERE address_index = ?1",
+                "SELECT value_zatoshi, block_height, block_time
+                 FROM payments WHERE address_index = ?1
+                 ORDER BY block_height ASC, output_index ASC",
             )?;
             let rows = stmt
                 .query_map([idx], |row| {
-                    Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, i64>(2)? as u32,
+                    ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             rows
         };
 
         let mut confirmed_sum: u64 = 0;
-        for (val, height) in payment_rows {
+        let mut threshold_payment_time: Option<u32> = None;
+
+        for (val, height, btime) in payment_rows {
             let confs = if tip_height >= height {
                 tip_height - height + 1
             } else {
                 0
             };
             if confs >= confirmations as u64 {
+                let prev_sum = confirmed_sum;
                 confirmed_sum = confirmed_sum.saturating_add(val);
+                if prev_sum < amount_zatoshi && confirmed_sum >= amount_zatoshi {
+                    threshold_payment_time = Some(btime);
+                }
             }
         }
 
         if confirmed_sum >= amount_zatoshi {
-            let is_late = now >= expires_at;
+            let is_late = match threshold_payment_time {
+                Some(btime) => (btime as u64) > expires_at,
+                None => false,
+            };
             tx.execute(
                 "UPDATE invoices SET status = 'paid', is_late = ?1 WHERE address_index = ?2",
                 params![if is_late { 1i64 } else { 0i64 }, idx],
@@ -288,34 +302,24 @@ pub fn apply_detected(
     })
 }
 
-/// Compares stored block hashes against current blocks from the server.
-/// If any mismatch is found, deletes payments at or above the reorganization height
-/// and returns `Some(reorg_height)`. If no reorg is detected, returns `Ok(None)`.
-pub fn check_and_rollback_reorg(
-    store: &Store,
-    current_blocks: &[(u64, String)],
-) -> Result<Option<u64>> {
-    let conn = store
-        .conn()
-        .lock()
-        .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
+/// Pure function comparing stored block hashes against current chain block hashes.
+///
+/// Returns `Some(lowest_mismatch_height)` if any block height present in both sets has differing hashes.
+/// If all common block heights match, or if current heights have no stored hashes, returns `None`.
+pub fn find_reorg_height<S1: AsRef<str>, S2: AsRef<str>>(
+    stored_hashes: &[(u64, S1)],
+    current_hashes: &[(u64, S2)],
+) -> Option<u64> {
+    let mut current_map = HashMap::new();
+    for (height, hash) in current_hashes {
+        current_map.insert(*height, hash.as_ref());
+    }
 
-    let mut lowest_reorg_height: Option<u64> = None;
-
-    for (height, current_hash) in current_blocks {
-        let stored_hashes: Vec<String> = {
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT block_hash FROM payments WHERE block_height = ?1",
-            )?;
-            let rows = stmt
-                .query_map([*height as i64], |row| row.get(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            rows
-        };
-
-        for stored_hash in stored_hashes {
-            if stored_hash != *current_hash {
-                lowest_reorg_height = Some(match lowest_reorg_height {
+    let mut lowest_mismatch: Option<u64> = None;
+    for (height, stored_hash) in stored_hashes {
+        if let Some(current_hash) = current_map.get(height) {
+            if stored_hash.as_ref() != *current_hash {
+                lowest_mismatch = Some(match lowest_mismatch {
                     Some(prev) => std::cmp::min(prev, *height),
                     None => *height,
                 });
@@ -323,9 +327,42 @@ pub fn check_and_rollback_reorg(
         }
     }
 
+    lowest_mismatch
+}
+
+/// Compares stored block hashes against current blocks from the server.
+/// If any mismatch is found, deletes payments at or above the reorganization height
+/// and returns `Some(reorg_height)`. If no reorg is detected, returns `Ok(None)`.
+pub fn check_and_rollback_reorg(
+    store: &Store,
+    current_blocks: &[(u64, String)],
+) -> Result<Option<u64>> {
+    if current_blocks.is_empty() {
+        return Ok(None);
+    }
+
+    let conn = store
+        .conn()
+        .lock()
+        .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
+
+    let min_height = current_blocks.iter().map(|(h, _)| *h).min().unwrap_or(0);
+    let max_height = current_blocks.iter().map(|(h, _)| *h).max().unwrap_or(0);
+
+    let stored_hashes: Vec<(u64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT block_height, block_hash FROM payments
+             WHERE block_height >= ?1 AND block_height <= ?2",
+        )?;
+        let rows = stmt.query_map(params![min_height as i64, max_height as i64], |row| {
+            Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
     drop(conn);
 
-    if let Some(reorg_height) = lowest_reorg_height {
+    if let Some(reorg_height) = find_reorg_height(&stored_hashes, current_blocks) {
         store.delete_payments_from_height(reorg_height)?;
         Ok(Some(reorg_height))
     } else {
@@ -336,6 +373,121 @@ pub fn check_and_rollback_reorg(
 /// Rolls back payments at or above the given block height.
 pub fn rollback_payments_from_height(store: &Store, height: u64) -> Result<usize> {
     store.delete_payments_from_height(height)
+}
+
+/// Current payment state of an invoice for the merchant dashboard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvoicePaymentState {
+    /// No payments have been detected for this invoice.
+    NoPayment,
+    /// Sufficient funds detected to pay the invoice, but awaiting required confirmations.
+    Detected {
+        received: u64,
+        confirmations_remaining: u32,
+    },
+    /// Partial payment detected, but total received is less than the invoice amount.
+    Underpaid {
+        received: u64,
+        missing: u64,
+    },
+    /// Confirmed sum meets or exceeds invoice amount.
+    Paid {
+        received: u64,
+        excess: u64,
+        late: bool,
+    },
+}
+
+/// Computes the detailed payment state for an invoice given current chain tip and required confirmations.
+pub fn invoice_payment_state(
+    store: &Store,
+    address_index: u32,
+    tip_height: u64,
+    confirmations: u32,
+) -> Result<InvoicePaymentState> {
+    let inv = match store.get_by_address_index(address_index)? {
+        Some(i) => i,
+        None => return Err(anyhow!("Invoice with address_index {} not found", address_index)),
+    };
+
+    let payments = store.get_payments_for_invoice(address_index)?;
+    if payments.is_empty() {
+        return Ok(InvoicePaymentState::NoPayment);
+    }
+
+    let mut total_received: u64 = 0;
+    let mut total_confirmed: u64 = 0;
+    let mut threshold_payment_btime: Option<u32> = None;
+    let mut detected_threshold_height: Option<u64> = None;
+
+    for p in &payments {
+        let prev_total = total_received;
+        total_received = total_received.saturating_add(p.value_zatoshi);
+        if prev_total < inv.amount_zatoshi && total_received >= inv.amount_zatoshi {
+            detected_threshold_height = Some(p.block_height);
+        }
+
+        let confs = if tip_height >= p.block_height {
+            tip_height - p.block_height + 1
+        } else {
+            0
+        };
+
+        if confs >= confirmations as u64 {
+            let prev_confirmed = total_confirmed;
+            total_confirmed = total_confirmed.saturating_add(p.value_zatoshi);
+            if prev_confirmed < inv.amount_zatoshi && total_confirmed >= inv.amount_zatoshi {
+                threshold_payment_btime = Some(p.block_time);
+            }
+        }
+    }
+
+    if total_received == 0 {
+        return Ok(InvoicePaymentState::NoPayment);
+    }
+
+    if total_confirmed >= inv.amount_zatoshi {
+        let late = if inv.status == crate::invoices::InvoiceStatus::Paid {
+            inv.is_late
+        } else if let Some(btime) = threshold_payment_btime {
+            (btime as u64) > inv.expires_at
+        } else {
+            false
+        };
+
+        let excess = total_confirmed.saturating_sub(inv.amount_zatoshi);
+        return Ok(InvoicePaymentState::Paid {
+            received: total_confirmed,
+            excess,
+            late,
+        });
+    }
+
+    if total_received < inv.amount_zatoshi {
+        let missing = inv.amount_zatoshi.saturating_sub(total_received);
+        return Ok(InvoicePaymentState::Underpaid {
+            received: total_received,
+            missing,
+        });
+    }
+
+    // total_received >= inv.amount_zatoshi, but total_confirmed < inv.amount_zatoshi
+    let confs = if let Some(h) = detected_threshold_height {
+        if tip_height >= h {
+            tip_height - h + 1
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    let confirmations_remaining = (confirmations as u64).saturating_sub(confs) as u32;
+
+    Ok(InvoicePaymentState::Detected {
+        received: total_received,
+        confirmations_remaining,
+    })
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -383,6 +535,7 @@ mod tests {
             address_index: inv.address_index,
             block_height: 100,
             block_hash: "hash100".to_string(),
+            block_time: (inv.expires_at - 100) as u32,
         };
 
         // Tip 102 with 3 confirmations: 102 - 100 + 1 = 3 >= 3
@@ -410,6 +563,7 @@ mod tests {
             address_index: inv.address_index,
             block_height: 100,
             block_hash: "hash100".to_string(),
+            block_time: (inv.expires_at - 100) as u32,
         };
 
         let res = apply_detected(&store, &[note], 105, 3).unwrap();
@@ -439,6 +593,7 @@ mod tests {
             address_index: inv.address_index,
             block_height: 100,
             block_hash: "hash100".to_string(),
+            block_time: (inv.expires_at - 100) as u32,
         };
         let note2 = DetectedNote {
             txid: "tx2".to_string(),
@@ -448,6 +603,7 @@ mod tests {
             address_index: inv.address_index,
             block_height: 101,
             block_hash: "hash101".to_string(),
+            block_time: (inv.expires_at - 50) as u32,
         };
 
         let res = apply_detected(&store, &[note1, note2], 105, 3).unwrap();
@@ -478,6 +634,7 @@ mod tests {
             address_index: inv.address_index,
             block_height: 100,
             block_hash: "hash100".to_string(),
+            block_time: (inv.expires_at - 100) as u32,
         };
 
         let res = apply_detected(&store, &[note], 105, 3).unwrap();
@@ -508,6 +665,7 @@ mod tests {
             address_index: inv.address_index,
             block_height: 100,
             block_hash: "hash100".to_string(),
+            block_time: (inv.expires_at - 100) as u32,
         };
 
         // Tip 101 with confirmations 3: 101 - 100 + 1 = 2 < 3
@@ -542,6 +700,7 @@ mod tests {
             address_index: inv.address_index,
             block_height: 100,
             block_hash: "hash100".to_string(),
+            block_time: (inv.expires_at - 100) as u32,
         };
 
         let res1 = apply_detected(&store, &[note.clone()], 105, 3).unwrap();
@@ -571,6 +730,7 @@ mod tests {
             address_index: 0,
             block_height: 100,
             block_hash: "hash100".to_string(),
+            block_time: 1000,
         };
         let note_res1 = DetectedNote {
             txid: "tx_res1".to_string(),
@@ -580,6 +740,7 @@ mod tests {
             address_index: 1,
             block_height: 100,
             block_hash: "hash100".to_string(),
+            block_time: 1000,
         };
         let note_unknown = DetectedNote {
             txid: "tx_unk".to_string(),
@@ -589,6 +750,7 @@ mod tests {
             address_index: 9999,
             block_height: 100,
             block_hash: "hash100".to_string(),
+            block_time: 1000,
         };
 
         let res = apply_detected(&store, &[note_res0, note_res1, note_unknown], 105, 3).unwrap();
@@ -608,7 +770,7 @@ mod tests {
         let store = open_store(":memory:").unwrap();
         let net = Network::TestNetwork;
         let uivk = test_uivk(&net);
-        // Expired immediately
+        // Expired immediately (expires_at = created_at)
         let inv = create_invoice(&store, &uivk, &net, 100_000, 0).unwrap();
         assert_eq!(inv.status, InvoiceStatus::Expired);
 
@@ -620,6 +782,7 @@ mod tests {
             address_index: inv.address_index,
             block_height: 100,
             block_hash: "hash100".to_string(),
+            block_time: (inv.expires_at + 10) as u32,
         };
 
         let res = apply_detected(&store, &[note], 105, 3).unwrap();
@@ -629,6 +792,271 @@ mod tests {
         let fetched = store.get_by_address_index(inv.address_index).unwrap().unwrap();
         assert_eq!(fetched.status, InvoiceStatus::Paid);
         assert!(fetched.is_late);
+    }
+
+    #[test]
+    fn test_mined_before_expiry_but_confirmed_after_expiry_is_not_late() {
+        let store = open_store(":memory:").unwrap();
+        let net = Network::TestNetwork;
+        let uivk = test_uivk(&net);
+        let inv = create_invoice(&store, &uivk, &net, 100_000, 3600).unwrap();
+
+        // Mined before expiry
+        let note = DetectedNote {
+            txid: "tx_before_exp".to_string(),
+            output_index: 0,
+            pool: "orchard".to_string(),
+            value_zatoshi: 100_000,
+            address_index: inv.address_index,
+            block_height: 100,
+            block_hash: "hash100".to_string(),
+            block_time: (inv.expires_at - 60) as u32,
+        };
+
+        // Confirmed when tip is 105
+        let res = apply_detected(&store, &[note], 105, 3).unwrap();
+        assert_eq!(res.payments_detected, 1);
+        assert_eq!(res.invoices_paid, 1);
+
+        let fetched = store.get_by_address_index(inv.address_index).unwrap().unwrap();
+        assert_eq!(fetched.status, InvoiceStatus::Paid);
+        assert!(!fetched.is_late, "Payment mined before expiry must NOT be marked late");
+    }
+
+    #[test]
+    fn test_mined_after_expiry_is_late() {
+        let store = open_store(":memory:").unwrap();
+        let net = Network::TestNetwork;
+        let uivk = test_uivk(&net);
+        let inv = create_invoice(&store, &uivk, &net, 100_000, 3600).unwrap();
+
+        // Mined after expiry
+        let note = DetectedNote {
+            txid: "tx_after_exp".to_string(),
+            output_index: 0,
+            pool: "ironwood".to_string(),
+            value_zatoshi: 100_000,
+            address_index: inv.address_index,
+            block_height: 100,
+            block_hash: "hash100".to_string(),
+            block_time: (inv.expires_at + 60) as u32,
+        };
+
+        let res = apply_detected(&store, &[note], 105, 3).unwrap();
+        assert_eq!(res.payments_detected, 1);
+        assert_eq!(res.invoices_paid, 1);
+
+        let fetched = store.get_by_address_index(inv.address_index).unwrap().unwrap();
+        assert_eq!(fetched.status, InvoiceStatus::Paid);
+        assert!(fetched.is_late, "Payment mined after expiry MUST be marked late");
+    }
+
+    #[test]
+    fn test_pure_reorg_no_mismatch() {
+        let stored = vec![(100u64, "hashA"), (101u64, "hashB")];
+        let current = vec![(100u64, "hashA"), (101u64, "hashB")];
+        assert_eq!(find_reorg_height(&stored, &current), None);
+    }
+
+    #[test]
+    fn test_pure_reorg_one_mismatch() {
+        let stored = vec![(100u64, "hashA"), (101u64, "hashB_old")];
+        let current = vec![(100u64, "hashA"), (101u64, "hashB_new")];
+        assert_eq!(find_reorg_height(&stored, &current), Some(101));
+    }
+
+    #[test]
+    fn test_pure_reorg_several_mismatches_returns_lowest_height() {
+        let stored = vec![
+            (100u64, "hashA_old"),
+            (101u64, "hashB_old"),
+            (102u64, "hashC_old"),
+        ];
+        let current = vec![
+            (100u64, "hashA_new"),
+            (101u64, "hashB_new"),
+            (102u64, "hashC_new"),
+        ];
+        assert_eq!(find_reorg_height(&stored, &current), Some(100));
+    }
+
+    #[test]
+    fn test_pure_reorg_heights_with_no_stored_payments() {
+        let stored = vec![(100u64, "hashA"), (105u64, "hashE")];
+        let current = vec![
+            (99u64, "hash99"),
+            (100u64, "hashA"),
+            (101u64, "hash101"),
+            (102u64, "hash102"),
+            (105u64, "hashE"),
+            (106u64, "hash106"),
+        ];
+        assert_eq!(find_reorg_height(&stored, &current), None);
+
+        let current_mismatch = vec![
+            (99u64, "hash99"),
+            (100u64, "hashA"),
+            (105u64, "hashE_fork"),
+        ];
+        assert_eq!(find_reorg_height(&stored, &current_mismatch), Some(105));
+    }
+
+    #[test]
+    fn test_check_and_rollback_reorg_returns_invoice_to_pending_and_clears_is_late() {
+        let store = open_store(":memory:").unwrap();
+        let net = Network::TestNetwork;
+        let uivk = test_uivk(&net);
+        let inv = create_invoice(&store, &uivk, &net, 100_000, 3600).unwrap();
+
+        let note = DetectedNote {
+            txid: "tx_reorg_late".to_string(),
+            output_index: 0,
+            pool: "orchard".to_string(),
+            value_zatoshi: 100_000,
+            address_index: inv.address_index,
+            block_height: 100,
+            block_hash: "hash100_original".to_string(),
+            block_time: (inv.expires_at + 10) as u32,
+        };
+
+        apply_detected(&store, &[note], 105, 3).unwrap();
+        let fetched_paid = store.get_by_address_index(inv.address_index).unwrap().unwrap();
+        assert_eq!(fetched_paid.status, InvoiceStatus::Paid);
+        assert!(fetched_paid.is_late);
+
+        // Reorg at block 100
+        let current_blocks = vec![(100u64, "hash100_reorged".to_string())];
+        let reorg_height = check_and_rollback_reorg(&store, &current_blocks).unwrap();
+        assert_eq!(reorg_height, Some(100));
+
+        // Invoice status must revert to Pending and is_late must be cleared
+        let fetched_after = store.get_by_address_index(inv.address_index).unwrap().unwrap();
+        assert_eq!(fetched_after.status, InvoiceStatus::Pending);
+        assert!(!fetched_after.is_late, "is_late must be cleared after reorg rollback");
+    }
+
+    #[test]
+    fn test_invoice_payment_state_no_payment() {
+        let store = open_store(":memory:").unwrap();
+        let net = Network::TestNetwork;
+        let uivk = test_uivk(&net);
+        let inv = create_invoice(&store, &uivk, &net, 100_000, 3600).unwrap();
+
+        let state = invoice_payment_state(&store, inv.address_index, 100, 3).unwrap();
+        assert_eq!(state, InvoicePaymentState::NoPayment);
+    }
+
+    #[test]
+    fn test_invoice_payment_state_detected() {
+        let store = open_store(":memory:").unwrap();
+        let net = Network::TestNetwork;
+        let uivk = test_uivk(&net);
+        let inv = create_invoice(&store, &uivk, &net, 100_000, 3600).unwrap();
+
+        let note = DetectedNote {
+            txid: "tx_det".to_string(),
+            output_index: 0,
+            pool: "orchard".to_string(),
+            value_zatoshi: 100_000,
+            address_index: inv.address_index,
+            block_height: 100,
+            block_hash: "hash100".to_string(),
+            block_time: (inv.expires_at - 100) as u32,
+        };
+        apply_detected(&store, &[note], 100, 3).unwrap();
+
+        // Tip 100 with confirmations 3: 1 confirmation received, 2 remaining
+        let state = invoice_payment_state(&store, inv.address_index, 100, 3).unwrap();
+        assert_eq!(
+            state,
+            InvoicePaymentState::Detected {
+                received: 100_000,
+                confirmations_remaining: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn test_invoice_payment_state_underpaid() {
+        let store = open_store(":memory:").unwrap();
+        let net = Network::TestNetwork;
+        let uivk = test_uivk(&net);
+        let inv = create_invoice(&store, &uivk, &net, 100_000, 3600).unwrap();
+
+        let note = DetectedNote {
+            txid: "tx_under".to_string(),
+            output_index: 0,
+            pool: "orchard".to_string(),
+            value_zatoshi: 40_000,
+            address_index: inv.address_index,
+            block_height: 100,
+            block_hash: "hash100".to_string(),
+            block_time: (inv.expires_at - 100) as u32,
+        };
+        apply_detected(&store, &[note], 105, 3).unwrap();
+
+        let state = invoice_payment_state(&store, inv.address_index, 105, 3).unwrap();
+        assert_eq!(
+            state,
+            InvoicePaymentState::Underpaid {
+                received: 40_000,
+                missing: 60_000,
+            }
+        );
+    }
+
+    #[test]
+    fn test_invoice_payment_state_paid() {
+        let store = open_store(":memory:").unwrap();
+        let net = Network::TestNetwork;
+        let uivk = test_uivk(&net);
+        let inv = create_invoice(&store, &uivk, &net, 100_000, 3600).unwrap();
+
+        let note = DetectedNote {
+            txid: "tx_paid".to_string(),
+            output_index: 0,
+            pool: "orchard".to_string(),
+            value_zatoshi: 120_000,
+            address_index: inv.address_index,
+            block_height: 100,
+            block_hash: "hash100".to_string(),
+            block_time: (inv.expires_at - 100) as u32,
+        };
+        apply_detected(&store, &[note], 105, 3).unwrap();
+
+        let state = invoice_payment_state(&store, inv.address_index, 105, 3).unwrap();
+        assert_eq!(
+            state,
+            InvoicePaymentState::Paid {
+                received: 120_000,
+                excess: 20_000,
+                late: false,
+            }
+        );
+
+        // Also test Paid late
+        let inv_late = create_invoice(&store, &uivk, &net, 100_000, 3600).unwrap();
+        let note_late = DetectedNote {
+            txid: "tx_paid_late".to_string(),
+            output_index: 0,
+            pool: "ironwood".to_string(),
+            value_zatoshi: 100_000,
+            address_index: inv_late.address_index,
+            block_height: 100,
+            block_hash: "hash100".to_string(),
+            block_time: (inv_late.expires_at + 50) as u32,
+        };
+        apply_detected(&store, &[note_late], 105, 3).unwrap();
+
+        let state_late = invoice_payment_state(&store, inv_late.address_index, 105, 3).unwrap();
+        assert_eq!(
+            state_late,
+            InvoicePaymentState::Paid {
+                received: 100_000,
+                excess: 0,
+                late: true,
+            }
+        );
     }
 
     #[test]
@@ -646,6 +1074,7 @@ mod tests {
             address_index: inv.address_index,
             block_height: 100,
             block_hash: "hash100".to_string(),
+            block_time: (inv.expires_at - 100) as u32,
         };
         let note2 = DetectedNote {
             txid: "tx_reorged".to_string(),
@@ -655,6 +1084,7 @@ mod tests {
             address_index: inv.address_index,
             block_height: 101,
             block_hash: "hash101".to_string(),
+            block_time: (inv.expires_at - 50) as u32,
         };
 
         apply_detected(&store, &[note1, note2], 105, 3).unwrap();

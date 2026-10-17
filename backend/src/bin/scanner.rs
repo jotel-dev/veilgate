@@ -76,6 +76,128 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
+const PASS_TIMEOUT: Duration = Duration::from_secs(60);
+const INITIAL_BACKOFF: Duration = Duration::from_secs(5);
+const MAX_BACKOFF: Duration = Duration::from_secs(300);
+
+async fn run_scan_pass(
+    client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
+    store: &veilgate_backend::invoices::Store,
+    network: &Network,
+    scanning_keys: &zcash_client_backend::scanning::ScanningKeys<u32, u32>,
+    nullifiers: &Nullifiers<u32>,
+    uivk: &zcash_keys::keys::UnifiedIncomingViewingKey,
+    confirmations: u32,
+    from_height: Option<u64>,
+) -> Result<()> {
+    // Query server chain tip and verify network
+    let info = client
+        .get_lightd_info(tonic::Request::new(Empty {}))
+        .await
+        .with_context(|| "Failed to query get_lightd_info from server")?
+        .into_inner();
+
+    if info.chain_name != "test" {
+        return Err(anyhow!(
+            "Connected server chain is '{}', but TESTNET ('test') is strictly required",
+            info.chain_name
+        ));
+    }
+
+    let tip = info.block_height;
+    let last_scanned = store.get_last_scanned_height()?;
+
+    let start_height = match last_scanned {
+        Some(last) => {
+            if let Some(explicit) = from_height {
+                if last < explicit {
+                    explicit
+                } else {
+                    last.saturating_sub(DEFAULT_REORG_DEPTH)
+                }
+            } else {
+                last.saturating_sub(DEFAULT_REORG_DEPTH)
+            }
+        }
+        None => from_height.unwrap_or_else(|| tip.saturating_sub(DEFAULT_LOOKBACK_BLOCKS)),
+    };
+
+    let end_height = tip;
+
+    if start_height > end_height {
+        // Nothing new to scan; apply empty batch to update confirmation thresholds if tip advanced
+        let _ = apply_detected(store, &[], tip, confirmations)?;
+    } else {
+        let range = BlockRange {
+            start: Some(BlockId {
+                height: start_height,
+                hash: vec![],
+            }),
+            end: Some(BlockId {
+                height: end_height,
+                hash: vec![],
+            }),
+            pool_types: vec![],
+        };
+
+        let mut stream = client
+            .get_block_range(tonic::Request::new(range))
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to request block range [{}..={}] from lightwalletd",
+                    start_height, end_height
+                )
+            })?
+            .into_inner();
+
+        let mut blocks_scanned: u64 = 0;
+        let mut detected_notes = Vec::new();
+        let mut prior_metadata: Option<BlockMetadata> = None;
+        let mut current_block_hashes = Vec::new();
+
+        while let Some(block) = stream
+            .message()
+            .await
+            .with_context(|| "Error receiving compact block from stream")?
+        {
+            let height = block.height;
+            let hash_hex = hex_encode(&block.hash);
+            current_block_hashes.push((height, hash_hex));
+
+            let (notes, metadata) = scan_compact_block(
+                network,
+                block,
+                scanning_keys,
+                nullifiers,
+                prior_metadata.as_ref(),
+                uivk,
+            )?;
+
+            detected_notes.extend(notes);
+            prior_metadata = Some(metadata);
+            blocks_scanned += 1;
+        }
+
+        // Check for reorganization and rollback if block hashes differ
+        let _ = check_and_rollback_reorg(store, &current_block_hashes)?;
+
+        // Apply detected notes to database
+        let result = apply_detected(store, &detected_notes, tip, confirmations)?;
+
+        // Update scan cursor in invoice_meta only after full pass success
+        store.set_last_scanned_height(end_height)?;
+
+        // Privacy rule: Never log addresses, txids, amounts, or keys. Print counts only.
+        println!(
+            "Scanned {} blocks ({}..={}), {} payments detected, {} invoices paid.",
+            blocks_scanned, start_height, end_height, result.payments_detected, result.invoices_paid
+        );
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Cli::parse();
@@ -101,16 +223,15 @@ async fn main() -> Result<()> {
     let store = open_store(&db_path)
         .with_context(|| format!("Failed to open invoice database at {}", db_path.display()))?;
 
-    // Connect to lightwalletd server over TLS
+    // Configure lightwalletd server endpoint over TLS
     let tls = ClientTlsConfig::new().with_webpki_roots();
     let endpoint = Endpoint::from_shared(args.url.clone())
         .with_context(|| format!("Invalid lightwalletd URL: {}", args.url))?
         .tls_config(tls)
         .with_context(|| "Failed to configure TLS for endpoint")?;
 
-    let mut client = CompactTxStreamerClient::connect(endpoint)
-        .await
-        .with_context(|| format!("Failed to connect to lightwalletd server at {}", args.url))?;
+    let mut client: Option<CompactTxStreamerClient<tonic::transport::Channel>> = None;
+    let mut backoff = INITIAL_BACKOFF;
 
     println!(
         "Starting VeilGate payment scanner (testnet, confirmations: {})...",
@@ -118,119 +239,80 @@ async fn main() -> Result<()> {
     );
 
     loop {
-        // Query server chain tip and verify network
-        let info = client
-            .get_lightd_info(tonic::Request::new(Empty {}))
-            .await
-            .with_context(|| "Failed to query get_lightd_info from server")?
-            .into_inner();
-
-        if info.chain_name != "test" {
-            eprintln!(
-                "ERROR: Connected server chain is '{}', but TESTNET ('test') is strictly required.",
-                info.chain_name
-            );
-            std::process::exit(1);
-        }
-
-        let tip = info.block_height;
-        let last_scanned = store.get_last_scanned_height()?;
-
-        let start_height = match last_scanned {
-            Some(last) => {
-                if let Some(explicit) = args.from_height {
-                    if last < explicit {
-                        explicit
-                    } else {
-                        last.saturating_sub(DEFAULT_REORG_DEPTH)
+        // Ensure gRPC client is connected; reconnect if needed
+        if client.is_none() {
+            match CompactTxStreamerClient::connect(endpoint.clone()).await {
+                Ok(c) => {
+                    client = Some(c);
+                }
+                Err(e) => {
+                    if args.once {
+                        return Err(e).context("Failed to connect to lightwalletd server");
                     }
-                } else {
-                    last.saturating_sub(DEFAULT_REORG_DEPTH)
+                    eprintln!(
+                        "scan pass failed, retrying in {} seconds",
+                        backoff.as_secs()
+                    );
+                    sleep(backoff).await;
+                    backoff = std::cmp::min(backoff.saturating_mul(2), MAX_BACKOFF);
+                    continue;
                 }
             }
-            None => {
-                args.from_height.unwrap_or_else(|| tip.saturating_sub(DEFAULT_LOOKBACK_BLOCKS))
-            }
-        };
-
-        let end_height = tip;
-
-        if start_height > end_height {
-            // Nothing new to scan; apply empty batch to update confirmation thresholds if tip advanced
-            let _ = apply_detected(&store, &[], tip, args.confirmations)?;
-        } else {
-            let range = BlockRange {
-                start: Some(BlockId {
-                    height: start_height,
-                    hash: vec![],
-                }),
-                end: Some(BlockId {
-                    height: end_height,
-                    hash: vec![],
-                }),
-                pool_types: vec![],
-            };
-
-            let mut stream = client
-                .get_block_range(tonic::Request::new(range))
-                .await
-                .with_context(|| {
-                    format!(
-                        "Failed to request block range [{}..={}] from lightwalletd",
-                        start_height, end_height
-                    )
-                })?
-                .into_inner();
-
-            let mut blocks_scanned: u64 = 0;
-            let mut detected_notes = Vec::new();
-            let mut prior_metadata: Option<BlockMetadata> = None;
-            let mut current_block_hashes = Vec::new();
-
-            while let Some(block) = stream
-                .message()
-                .await
-                .with_context(|| "Error receiving compact block from stream")?
-            {
-                let height = block.height;
-                let hash_hex = hex_encode(&block.hash);
-                current_block_hashes.push((height, hash_hex));
-
-                let (notes, metadata) = scan_compact_block(
-                    &network,
-                    block,
-                    &scanning_keys,
-                    &nullifiers,
-                    prior_metadata.as_ref(),
-                    &uivk,
-                )?;
-
-                detected_notes.extend(notes);
-                prior_metadata = Some(metadata);
-                blocks_scanned += 1;
-            }
-
-            // Check for reorganization and rollback if block hashes differ
-            let _ = check_and_rollback_reorg(&store, &current_block_hashes)?;
-
-            // Apply detected notes to database
-            let result = apply_detected(&store, &detected_notes, tip, args.confirmations)?;
-
-            // Update scan cursor in invoice_meta
-            store.set_last_scanned_height(end_height)?;
-
-            // Privacy rule: Never log addresses, txids, amounts, or keys. Print counts only.
-            println!(
-                "Scanned {} blocks ({}..={}), {} payments detected, {} invoices paid.",
-                blocks_scanned, start_height, end_height, result.payments_detected, result.invoices_paid
-            );
         }
 
-        if args.once {
-            break;
-        }
+        let cl = client.as_mut().expect("client verified Some above");
 
-        sleep(Duration::from_secs(args.interval_seconds)).await;
+        let pass_res = tokio::time::timeout(
+            PASS_TIMEOUT,
+            run_scan_pass(
+                cl,
+                &store,
+                &network,
+                &scanning_keys,
+                &nullifiers,
+                &uivk,
+                args.confirmations,
+                args.from_height,
+            ),
+        )
+        .await;
+
+        match pass_res {
+            Ok(Ok(())) => {
+                backoff = INITIAL_BACKOFF;
+                if args.once {
+                    break;
+                }
+                sleep(Duration::from_secs(args.interval_seconds)).await;
+            }
+            Ok(Err(e)) => {
+                if args.once {
+                    return Err(e);
+                }
+                client = None;
+                eprintln!(
+                    "scan pass failed, retrying in {} seconds",
+                    backoff.as_secs()
+                );
+                sleep(backoff).await;
+                backoff = std::cmp::min(backoff.saturating_mul(2), MAX_BACKOFF);
+            }
+            Err(_elapsed) => {
+                if args.once {
+                    return Err(anyhow!(
+                        "Scan pass timed out after {} seconds",
+                        PASS_TIMEOUT.as_secs()
+                    ));
+                }
+                client = None;
+                eprintln!(
+                    "scan pass failed, retrying in {} seconds",
+                    backoff.as_secs()
+                );
+                sleep(backoff).await;
+                backoff = std::cmp::min(backoff.saturating_mul(2), MAX_BACKOFF);
+            }
+        }
     }
 
     Ok(())

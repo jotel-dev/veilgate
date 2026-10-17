@@ -13,6 +13,7 @@ use zcash_protocol::value::Zatoshis;
 use zip321::{Payment, TransactionRequest};
 
 use crate::addresses::{encode_address, invoice_address, FIRST_INVOICE_INDEX};
+pub use crate::scanner::{invoice_payment_state, InvoicePaymentState};
 
 /// Default relative path to the SQLite database.
 pub const DEFAULT_DB_PATH: &str = ".veilgate/veilgate.db";
@@ -85,6 +86,20 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
+/// Checks whether a column exists on a SQLite table via PRAGMA table_info.
+pub fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let pragma_sql = format!("PRAGMA table_info({})", table);
+    let mut stmt = conn.prepare(&pragma_sql)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name.eq_ignore_ascii_case(column) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Opens an existing SQLite invoice store or initializes a new one.
 ///
 /// Supports filesystem paths or `":memory:"` for test instances.
@@ -141,6 +156,7 @@ pub fn open_store(path: impl AsRef<Path>) -> Result<Store> {
             value_zatoshi INTEGER NOT NULL,
             block_height INTEGER NOT NULL,
             block_hash TEXT NOT NULL,
+            block_time INTEGER NOT NULL DEFAULT 0,
             UNIQUE(txid, output_index, pool),
             FOREIGN KEY(address_index) REFERENCES invoices(address_index)
          );
@@ -149,8 +165,19 @@ pub fn open_store(path: impl AsRef<Path>) -> Result<Store> {
          CREATE INDEX IF NOT EXISTS idx_payments_block_height ON payments(block_height);",
     )?;
 
-    // Ensure is_late column exists in existing databases
-    let _ = conn.execute("ALTER TABLE invoices ADD COLUMN is_late INTEGER NOT NULL DEFAULT 0", []);
+    // Safe migrations for existing databases checking PRAGMA table_info
+    if !column_exists(&conn, "invoices", "is_late")? {
+        conn.execute(
+            "ALTER TABLE invoices ADD COLUMN is_late INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !column_exists(&conn, "payments", "block_time")? {
+        conn.execute(
+            "ALTER TABLE payments ADD COLUMN block_time INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
 
     // Monotonic index setup:
     // Determine the next index, ensuring it never goes below FIRST_INVOICE_INDEX (2)
@@ -413,6 +440,7 @@ pub struct PaymentRecord {
     pub value_zatoshi: u64,
     pub block_height: u64,
     pub block_hash: String,
+    pub block_time: u32,
 }
 
 /// Summary of all payments and confirmation status for an invoice.
@@ -501,7 +529,7 @@ pub fn get_payments_for_invoice(store: &Store, address_index: u32) -> Result<Vec
         .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
 
     let mut stmt = conn.prepare(
-        "SELECT address_index, txid, output_index, pool, value_zatoshi, block_height, block_hash
+        "SELECT address_index, txid, output_index, pool, value_zatoshi, block_height, block_hash, block_time
          FROM payments WHERE address_index = ?1 ORDER BY block_height ASC, output_index ASC",
     )?;
 
@@ -513,6 +541,7 @@ pub fn get_payments_for_invoice(store: &Store, address_index: u32) -> Result<Vec
         let val_i64: i64 = row.get(4)?;
         let height_i64: i64 = row.get(5)?;
         let block_hash: String = row.get(6)?;
+        let block_time_i64: i64 = row.get(7)?;
 
         Ok(PaymentRecord {
             address_index,
@@ -522,6 +551,7 @@ pub fn get_payments_for_invoice(store: &Store, address_index: u32) -> Result<Vec
             value_zatoshi: val_i64 as u64,
             block_height: height_i64 as u64,
             block_hash,
+            block_time: block_time_i64 as u32,
         })
     })?;
 
@@ -650,6 +680,32 @@ pub fn delete_payments_from_height(store: &Store, height: u64) -> Result<usize> 
                     "UPDATE invoices SET status = 'pending', is_late = 0 WHERE address_index = ?1",
                     [idx],
                 )?;
+            } else {
+                let expires_i64: i64 = tx.query_row(
+                    "SELECT expires_at FROM invoices WHERE address_index = ?1",
+                    [idx],
+                    |row| row.get(0),
+                )?;
+                let mut stmt_rem = tx.prepare(
+                    "SELECT value_zatoshi, block_time FROM payments WHERE address_index = ?1 ORDER BY block_height ASC, output_index ASC",
+                )?;
+                let rem_rows = stmt_rem.query_map([idx], |row| {
+                    Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u32))
+                })?;
+                let mut cum = 0u64;
+                let mut late = false;
+                for r in rem_rows {
+                    let (val, btime) = r?;
+                    cum = cum.saturating_add(val);
+                    if cum >= amount_zatoshi {
+                        late = (btime as u64) > (expires_i64 as u64);
+                        break;
+                    }
+                }
+                tx.execute(
+                    "UPDATE invoices SET is_late = ?1 WHERE address_index = ?2",
+                    params![if late { 1i64 } else { 0i64 }, idx],
+                )?;
             }
         }
     }
@@ -736,6 +792,16 @@ impl Store {
     /// Rolls back payments from the given block height.
     pub fn delete_payments_from_height(&self, height: u64) -> Result<usize> {
         delete_payments_from_height(self, height)
+    }
+
+    /// Computes the dashboard payment state for an invoice.
+    pub fn invoice_payment_state(
+        &self,
+        address_index: u32,
+        tip_height: u64,
+        confirmations: u32,
+    ) -> Result<InvoicePaymentState> {
+        invoice_payment_state(self, address_index, tip_height, confirmations)
     }
 }
 
@@ -1065,4 +1131,59 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_safe_migration_adds_missing_columns() {
+        let db_path = std::env::temp_dir().join(format!("veilgate_migration_test_{}.db", rand::random::<u64>()));
+
+        // Create legacy schema manually without is_late on invoices and without block_time on payments
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE invoices (
+                    address_index INTEGER NOT NULL UNIQUE,
+                    public_id TEXT NOT NULL UNIQUE,
+                    amount_zatoshi INTEGER NOT NULL,
+                    address TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    status TEXT NOT NULL
+                 );
+                 CREATE TABLE payments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    address_index INTEGER NOT NULL,
+                    txid TEXT NOT NULL,
+                    output_index INTEGER NOT NULL,
+                    pool TEXT NOT NULL,
+                    value_zatoshi INTEGER NOT NULL,
+                    block_height INTEGER NOT NULL,
+                    block_hash TEXT NOT NULL,
+                    UNIQUE(txid, output_index, pool)
+                 );",
+            )
+            .unwrap();
+
+            assert!(!column_exists(&conn, "invoices", "is_late").unwrap());
+            assert!(!column_exists(&conn, "payments", "block_time").unwrap());
+        }
+
+        // Open store using open_store, which runs safe migrations
+        let store = open_store(&db_path).unwrap();
+        let conn = store.conn().lock().unwrap();
+
+        assert!(column_exists(&conn, "invoices", "is_late").unwrap());
+        assert!(column_exists(&conn, "payments", "block_time").unwrap());
+
+        // Opening again should be idempotent and not fail
+        drop(conn);
+        drop(store);
+        let store2 = open_store(&db_path).unwrap();
+        let conn2 = store2.conn().lock().unwrap();
+        assert!(column_exists(&conn2, "invoices", "is_late").unwrap());
+        assert!(column_exists(&conn2, "payments", "block_time").unwrap());
+        drop(conn2);
+        drop(store2);
+        let _ = std::fs::remove_file(&db_path);
+    }
 }
+
