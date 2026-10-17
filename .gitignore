@@ -16,3 +16,4 @@ target/
 # Node and misc
 node_modules/
 .DS_Store
+docs/design/landing-reference.png
