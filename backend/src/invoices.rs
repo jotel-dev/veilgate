@@ -72,6 +72,8 @@ pub struct Invoice {
     pub status: InvoiceStatus,
     /// Flag indicating whether the invoice was marked paid after its expiration.
     pub is_late: bool,
+    /// Flag indicating whether this is an isolated demo invoice.
+    pub is_demo: bool,
 }
 
 impl Invoice {
@@ -144,7 +146,8 @@ pub fn open_store(path: impl AsRef<Path>) -> Result<Store> {
             created_at INTEGER NOT NULL,
             expires_at INTEGER NOT NULL,
             status TEXT NOT NULL,
-            is_late INTEGER NOT NULL DEFAULT 0
+            is_late INTEGER NOT NULL DEFAULT 0,
+            is_demo INTEGER NOT NULL DEFAULT 0
          );
 
          CREATE TABLE IF NOT EXISTS payments (
@@ -169,6 +172,12 @@ pub fn open_store(path: impl AsRef<Path>) -> Result<Store> {
     if !column_exists(&conn, "invoices", "is_late")? {
         conn.execute(
             "ALTER TABLE invoices ADD COLUMN is_late INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !column_exists(&conn, "invoices", "is_demo")? {
+        conn.execute(
+            "ALTER TABLE invoices ADD COLUMN is_demo INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }
@@ -207,17 +216,14 @@ pub fn open_store(path: impl AsRef<Path>) -> Result<Store> {
 
 /// Creates a new invoice in the store.
 ///
-/// Derives an Orchard-only shielded address using the viewing key at the next
-/// monotonically allocated address index, records the invoice in SQLite,
-/// and returns the `Invoice` struct.
-///
-/// Rejects `amount_zatoshi == 0` and amounts exceeding `MAX_ZATOSHI` (21,000,000 ZEC).
-pub fn create_invoice(
+/// Internal invoice creation logic supporting regular merchant or demo invoices.
+pub fn create_invoice_internal(
     store: &Store,
     uivk: &UnifiedIncomingViewingKey,
     network: &Network,
     amount_zatoshi: u64,
     valid_for_seconds: u64,
+    is_demo: bool,
 ) -> Result<Invoice> {
     if amount_zatoshi == 0 {
         return Err(anyhow!("Invoice amount must be greater than 0 zatoshis"));
@@ -279,8 +285,8 @@ pub fn create_invoice(
 
     tx.execute(
         "INSERT INTO invoices (
-            address_index, public_id, amount_zatoshi, address, created_at, expires_at, status, is_late
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0)",
+            address_index, public_id, amount_zatoshi, address, created_at, expires_at, status, is_late, is_demo
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, ?7)",
         params![
             allocated_index,
             public_id,
@@ -288,6 +294,7 @@ pub fn create_invoice(
             address_str,
             created_i64,
             expires_i64,
+            if is_demo { 1i64 } else { 0i64 },
         ],
     )?;
 
@@ -308,7 +315,30 @@ pub fn create_invoice(
         expires_at,
         status,
         is_late: false,
+        is_demo,
     })
+}
+
+/// Creates a standard merchant invoice in the store (is_demo = 0).
+pub fn create_invoice(
+    store: &Store,
+    uivk: &UnifiedIncomingViewingKey,
+    network: &Network,
+    amount_zatoshi: u64,
+    valid_for_seconds: u64,
+) -> Result<Invoice> {
+    create_invoice_internal(store, uivk, network, amount_zatoshi, valid_for_seconds, false)
+}
+
+/// Creates an isolated demo invoice in the store (is_demo = 1).
+pub fn create_demo_invoice(
+    store: &Store,
+    uivk: &UnifiedIncomingViewingKey,
+    network: &Network,
+    amount_zatoshi: u64,
+    valid_for_seconds: u64,
+) -> Result<Invoice> {
+    create_invoice_internal(store, uivk, network, amount_zatoshi, valid_for_seconds, true)
 }
 
 /// Retrieves an invoice by its 128-bit public ID.
@@ -321,7 +351,7 @@ pub fn get_by_public_id(store: &Store, id: &str) -> Result<Option<Invoice>> {
         .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
 
     let mut stmt = conn.prepare(
-        "SELECT address_index, public_id, amount_zatoshi, address, created_at, expires_at, status, is_late
+        "SELECT address_index, public_id, amount_zatoshi, address, created_at, expires_at, status, is_late, is_demo
          FROM invoices WHERE public_id = ?1",
     )?;
 
@@ -335,6 +365,7 @@ pub fn get_by_public_id(store: &Store, id: &str) -> Result<Option<Invoice>> {
         let expires_i64: i64 = row.get(5)?;
         let db_status: String = row.get(6)?;
         let is_late_i64: i64 = row.get(7).unwrap_or(0);
+        let is_demo_i64: i64 = row.get(8).unwrap_or(0);
 
         let amount_zatoshi = u64::try_from(amount_i64)
             .map_err(|e| anyhow!("Negative amount in database: {e}"))?;
@@ -359,6 +390,7 @@ pub fn get_by_public_id(store: &Store, id: &str) -> Result<Option<Invoice>> {
             expires_at,
             status,
             is_late: is_late_i64 != 0,
+            is_demo: is_demo_i64 != 0,
         }))
     } else {
         Ok(None)
@@ -375,7 +407,7 @@ pub fn list_invoices(store: &Store) -> Result<Vec<Invoice>> {
         .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
 
     let mut stmt = conn.prepare(
-        "SELECT address_index, public_id, amount_zatoshi, address, created_at, expires_at, status, is_late
+        "SELECT address_index, public_id, amount_zatoshi, address, created_at, expires_at, status, is_late, is_demo
          FROM invoices ORDER BY address_index ASC",
     )?;
 
@@ -393,6 +425,7 @@ pub fn list_invoices(store: &Store) -> Result<Vec<Invoice>> {
         let expires_i64: i64 = row.get(5)?;
         let db_status: String = row.get(6)?;
         let is_late_i64: i64 = row.get(7).unwrap_or(0);
+        let is_demo_i64: i64 = row.get(8).unwrap_or(0);
 
         let amount_zatoshi = u64::try_from(amount_i64)
             .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Integer, Box::new(e)))?;
@@ -412,6 +445,7 @@ pub fn list_invoices(store: &Store) -> Result<Vec<Invoice>> {
             expires_at,
             status,
             is_late: is_late_i64 != 0,
+            is_demo: is_demo_i64 != 0,
         })
     })?;
 
@@ -464,7 +498,7 @@ pub fn get_by_address_index(store: &Store, index: u32) -> Result<Option<Invoice>
         .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
 
     let mut stmt = conn.prepare(
-        "SELECT address_index, public_id, amount_zatoshi, address, created_at, expires_at, status, is_late
+        "SELECT address_index, public_id, amount_zatoshi, address, created_at, expires_at, status, is_late, is_demo
          FROM invoices WHERE address_index = ?1",
     )?;
 
@@ -478,6 +512,7 @@ pub fn get_by_address_index(store: &Store, index: u32) -> Result<Option<Invoice>
         let expires_i64: i64 = row.get(5)?;
         let db_status: String = row.get(6)?;
         let is_late_i64: i64 = row.get(7).unwrap_or(0);
+        let is_demo_i64: i64 = row.get(8).unwrap_or(0);
 
         let amount_zatoshi = u64::try_from(amount_i64)
             .map_err(|e| anyhow!("Negative amount in database: {e}"))?;
@@ -502,6 +537,7 @@ pub fn get_by_address_index(store: &Store, index: u32) -> Result<Option<Invoice>
             expires_at,
             status,
             is_late: is_late_i64 != 0,
+            is_demo: is_demo_i64 != 0,
         }))
     } else {
         Ok(None)
@@ -636,6 +672,36 @@ pub fn set_last_scanned_height(store: &Store, height: u64) -> Result<()> {
     Ok(())
 }
 
+/// Retrieves the recorded chain tip height from invoice_meta.
+pub fn get_chain_tip(store: &Store) -> Result<Option<u64>> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
+    let val: Option<i64> = conn
+        .query_row(
+            "SELECT value FROM invoice_meta WHERE key = 'chain_tip'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(val.map(|v| v as u64))
+}
+
+/// Stores the current chain tip height in invoice_meta.
+pub fn set_chain_tip(store: &Store, tip: u64) -> Result<()> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
+    conn.execute(
+        "INSERT INTO invoice_meta (key, value) VALUES ('chain_tip', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [tip as i64],
+    )?;
+    Ok(())
+}
+
 /// Deletes all payments at or above the given block height (used during chain reorganization).
 /// Automatically reverts any invoices marked paid whose remaining confirmed payments fall below amount_zatoshi.
 pub fn delete_payments_from_height(store: &Store, height: u64) -> Result<usize> {
@@ -744,6 +810,22 @@ impl Store {
         create_invoice(self, uivk, network, amount_zatoshi, valid_for_seconds)
     }
 
+    /// Creates an isolated demo invoice within this store.
+    pub fn create_demo_invoice(
+        &self,
+        uivk: &UnifiedIncomingViewingKey,
+        network: &Network,
+        amount_zatoshi: u64,
+        valid_for_seconds: u64,
+    ) -> Result<Invoice> {
+        create_demo_invoice(self, uivk, network, amount_zatoshi, valid_for_seconds)
+    }
+
+    /// Deletes unpaid demo invoices that have been expired for more than `older_than_seconds`.
+    pub fn prune_expired_demo_invoices(&self, older_than_seconds: u64) -> Result<usize> {
+        prune_expired_demo_invoices(self, older_than_seconds)
+    }
+
     /// Retrieves an invoice by public ID within this store.
     pub fn get_by_public_id(&self, id: &str) -> Result<Option<Invoice>> {
         get_by_public_id(self, id)
@@ -803,6 +885,53 @@ impl Store {
     ) -> Result<InvoicePaymentState> {
         invoice_payment_state(self, address_index, tip_height, confirmations)
     }
+
+    /// Gets the recorded chain tip height.
+    pub fn get_chain_tip(&self) -> Result<Option<u64>> {
+        get_chain_tip(self)
+    }
+
+    /// Sets the current chain tip height.
+    pub fn set_chain_tip(&self, tip: u64) -> Result<()> {
+        set_chain_tip(self, tip)
+    }
+}
+
+/// Deletes unpaid demo invoices that have been expired for more than `older_than_seconds` seconds.
+///
+/// Ensures monotonic index invariant: the next_address_index counter in invoice_meta
+/// is never decreased and address indices are never reused.
+pub fn prune_expired_demo_invoices(store: &Store, older_than_seconds: u64) -> Result<usize> {
+    let mut conn = store
+        .conn
+        .lock()
+        .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
+    let tx = conn.transaction()?;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let cutoff = now.saturating_sub(older_than_seconds);
+
+    // Delete associated payments first if any exist
+    tx.execute(
+        "DELETE FROM payments WHERE address_index IN (
+            SELECT address_index FROM invoices
+            WHERE is_demo = 1 AND status != 'paid' AND expires_at <= ?1
+        )",
+        [cutoff as i64],
+    )?;
+
+    // Delete unpaid expired demo invoices
+    let deleted = tx.execute(
+        "DELETE FROM invoices WHERE is_demo = 1 AND status != 'paid' AND expires_at <= ?1",
+        [cutoff as i64],
+    )?;
+
+    tx.commit()?;
+    Ok(deleted)
 }
 
 /// Constructs a ZIP 321 payment URI string for an invoice.
@@ -1164,6 +1293,7 @@ mod tests {
             .unwrap();
 
             assert!(!column_exists(&conn, "invoices", "is_late").unwrap());
+            assert!(!column_exists(&conn, "invoices", "is_demo").unwrap());
             assert!(!column_exists(&conn, "payments", "block_time").unwrap());
         }
 
@@ -1172,6 +1302,7 @@ mod tests {
         let conn = store.conn().lock().unwrap();
 
         assert!(column_exists(&conn, "invoices", "is_late").unwrap());
+        assert!(column_exists(&conn, "invoices", "is_demo").unwrap());
         assert!(column_exists(&conn, "payments", "block_time").unwrap());
 
         // Opening again should be idempotent and not fail
@@ -1180,10 +1311,46 @@ mod tests {
         let store2 = open_store(&db_path).unwrap();
         let conn2 = store2.conn().lock().unwrap();
         assert!(column_exists(&conn2, "invoices", "is_late").unwrap());
+        assert!(column_exists(&conn2, "invoices", "is_demo").unwrap());
         assert!(column_exists(&conn2, "payments", "block_time").unwrap());
         drop(conn2);
         drop(store2);
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn test_prune_expired_demo_invoices_monotonic_index() {
+        let store = open_store(":memory:").unwrap();
+        let net = Network::TestNetwork;
+        let uivk = test_uivk(&net);
+
+        // Create standard invoice
+        let standard = create_invoice(&store, &uivk, &net, 100_000, 3600).unwrap();
+        assert!(!standard.is_demo);
+        assert_eq!(standard.address_index, 2);
+
+        // Create demo invoice that is already expired
+        let demo_expired = create_demo_invoice(&store, &uivk, &net, 100_000, 0).unwrap();
+        assert!(demo_expired.is_demo);
+        assert_eq!(demo_expired.address_index, 3);
+
+        // Create active demo invoice
+        let demo_active = create_demo_invoice(&store, &uivk, &net, 200_000, 3600).unwrap();
+        assert!(demo_active.is_demo);
+        assert_eq!(demo_active.address_index, 4);
+
+        // Pruning with older_than_seconds = 0 should delete demo_expired (unpaid demo expired)
+        // but keep standard (not demo) and demo_active (not expired)
+        let deleted = prune_expired_demo_invoices(&store, 0).unwrap();
+        assert_eq!(deleted, 1);
+
+        assert!(get_by_public_id(&store, &standard.public_id).unwrap().is_some());
+        assert!(get_by_public_id(&store, &demo_expired.public_id).unwrap().is_none());
+        assert!(get_by_public_id(&store, &demo_active.public_id).unwrap().is_some());
+
+        // Ensure next invoice NEVER reuses index 3, and gets index 5
+        let next_inv = create_invoice(&store, &uivk, &net, 300_000, 3600).unwrap();
+        assert_eq!(next_inv.address_index, 5);
     }
 }
 

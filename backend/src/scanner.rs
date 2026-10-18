@@ -1,14 +1,17 @@
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use rusqlite::params;
 use rusqlite::OptionalExtension;
+use tonic::transport::Channel;
 use zcash_client_backend::data_api::BlockMetadata;
 use zcash_client_backend::proto::compact_formats::CompactBlock;
+use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
+use zcash_client_backend::proto::service::{BlockId, BlockRange, Empty};
 use zcash_client_backend::scanning::{scan_block, Nullifiers, ScanningKey, ScanningKeys};
 use zcash_keys::address::UnifiedAddress;
 use zcash_keys::keys::UnifiedIncomingViewingKey;
-use zcash_protocol::consensus::Parameters;
+use zcash_protocol::consensus::{Network, Parameters};
 
 use crate::addresses::FIRST_INVOICE_INDEX;
 use crate::invoices::Store;
@@ -487,6 +490,146 @@ pub fn invoice_payment_state(
     Ok(InvoicePaymentState::Detected {
         received: total_received,
         confirmations_remaining,
+    })
+}
+
+/// Summary of a completed scan pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanPassSummary {
+    pub blocks_scanned: u64,
+    pub start_height: u64,
+    pub end_height: u64,
+    pub payments_detected: usize,
+    pub invoices_paid: usize,
+}
+
+/// Executes a single scan pass across the lightwalletd compact block stream.
+///
+/// Records the server chain tip in `invoice_meta` under key `'chain_tip'`.
+/// Updates `last_scanned_height` in `invoice_meta` ONLY upon full pass completion.
+pub async fn run_scan_pass(
+    client: &mut CompactTxStreamerClient<Channel>,
+    store: &Store,
+    network: &Network,
+    scanning_keys: &ScanningKeys<u32, u32>,
+    nullifiers: &Nullifiers<u32>,
+    uivk: &UnifiedIncomingViewingKey,
+    confirmations: u32,
+    from_height: Option<u64>,
+) -> Result<ScanPassSummary> {
+    let info = client
+        .get_lightd_info(tonic::Request::new(Empty {}))
+        .await
+        .with_context(|| "Failed to query get_lightd_info from server")?
+        .into_inner();
+
+    if info.chain_name != "test" {
+        return Err(anyhow!(
+            "Connected server chain is '{}', but TESTNET ('test') is strictly required",
+            info.chain_name
+        ));
+    }
+
+    let tip = info.block_height;
+    // Record current chain tip in invoice_meta
+    store.set_chain_tip(tip)?;
+
+    let last_scanned = store.get_last_scanned_height()?;
+
+    let start_height = match last_scanned {
+        Some(last) => {
+            if let Some(explicit) = from_height {
+                if last < explicit {
+                    explicit
+                } else {
+                    last.saturating_sub(DEFAULT_REORG_DEPTH)
+                }
+            } else {
+                last.saturating_sub(DEFAULT_REORG_DEPTH)
+            }
+        }
+        None => from_height.unwrap_or_else(|| tip.saturating_sub(DEFAULT_LOOKBACK_BLOCKS)),
+    };
+
+    let end_height = tip;
+
+    if start_height > end_height {
+        let result = apply_detected(store, &[], tip, confirmations)?;
+        return Ok(ScanPassSummary {
+            blocks_scanned: 0,
+            start_height,
+            end_height,
+            payments_detected: result.payments_detected,
+            invoices_paid: result.invoices_paid,
+        });
+    }
+
+    let range = BlockRange {
+        start: Some(BlockId {
+            height: start_height,
+            hash: vec![],
+        }),
+        end: Some(BlockId {
+            height: end_height,
+            hash: vec![],
+        }),
+        pool_types: vec![],
+    };
+
+    let mut stream = client
+        .get_block_range(tonic::Request::new(range))
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to request block range [{}..={}] from lightwalletd",
+                start_height, end_height
+            )
+        })?
+        .into_inner();
+
+    let mut blocks_scanned: u64 = 0;
+    let mut detected_notes = Vec::new();
+    let mut prior_metadata: Option<BlockMetadata> = None;
+    let mut current_block_hashes = Vec::new();
+
+    while let Some(block) = stream
+        .message()
+        .await
+        .with_context(|| "Error receiving compact block from stream")?
+    {
+        let height = block.height;
+        let hash_hex = hex_encode(&block.hash);
+        current_block_hashes.push((height, hash_hex));
+
+        let (notes, metadata) = scan_compact_block(
+            network,
+            block,
+            scanning_keys,
+            nullifiers,
+            prior_metadata.as_ref(),
+            uivk,
+        )?;
+
+        detected_notes.extend(notes);
+        prior_metadata = Some(metadata);
+        blocks_scanned += 1;
+    }
+
+    // Check for reorganization and rollback if block hashes differ
+    let _ = check_and_rollback_reorg(store, &current_block_hashes)?;
+
+    // Apply detected notes to database
+    let result = apply_detected(store, &detected_notes, tip, confirmations)?;
+
+    // Update scan cursor in invoice_meta only after full pass success
+    store.set_last_scanned_height(end_height)?;
+
+    Ok(ScanPassSummary {
+        blocks_scanned,
+        start_height,
+        end_height,
+        payments_detected: result.payments_detected,
+        invoices_paid: result.invoices_paid,
     })
 }
 

@@ -5,17 +5,14 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use tokio::time::sleep;
 use tonic::transport::{ClientTlsConfig, Endpoint};
-use zcash_client_backend::data_api::BlockMetadata;
 use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
-use zcash_client_backend::proto::service::{BlockId, BlockRange, Empty};
 use zcash_client_backend::scanning::Nullifiers;
 use zcash_protocol::consensus::Network;
 
 use veilgate_backend::addresses::load_viewing_key;
 use veilgate_backend::invoices::open_store;
 use veilgate_backend::scanner::{
-    apply_detected, build_scanning_keys, check_and_rollback_reorg, scan_compact_block,
-    DEFAULT_CONFIRMATIONS, DEFAULT_LOOKBACK_BLOCKS, DEFAULT_REORG_DEPTH,
+    build_scanning_keys, run_scan_pass, DEFAULT_CONFIRMATIONS,
 };
 
 #[derive(Parser, Debug)]
@@ -67,136 +64,9 @@ fn resolve_file_path(relative: &str) -> PathBuf {
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write;
-        let _ = write!(s, "{:02x}", b);
-    }
-    s
-}
-
 const PASS_TIMEOUT: Duration = Duration::from_secs(60);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(5);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
-
-async fn run_scan_pass(
-    client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
-    store: &veilgate_backend::invoices::Store,
-    network: &Network,
-    scanning_keys: &zcash_client_backend::scanning::ScanningKeys<u32, u32>,
-    nullifiers: &Nullifiers<u32>,
-    uivk: &zcash_keys::keys::UnifiedIncomingViewingKey,
-    confirmations: u32,
-    from_height: Option<u64>,
-) -> Result<()> {
-    // Query server chain tip and verify network
-    let info = client
-        .get_lightd_info(tonic::Request::new(Empty {}))
-        .await
-        .with_context(|| "Failed to query get_lightd_info from server")?
-        .into_inner();
-
-    if info.chain_name != "test" {
-        return Err(anyhow!(
-            "Connected server chain is '{}', but TESTNET ('test') is strictly required",
-            info.chain_name
-        ));
-    }
-
-    let tip = info.block_height;
-    let last_scanned = store.get_last_scanned_height()?;
-
-    let start_height = match last_scanned {
-        Some(last) => {
-            if let Some(explicit) = from_height {
-                if last < explicit {
-                    explicit
-                } else {
-                    last.saturating_sub(DEFAULT_REORG_DEPTH)
-                }
-            } else {
-                last.saturating_sub(DEFAULT_REORG_DEPTH)
-            }
-        }
-        None => from_height.unwrap_or_else(|| tip.saturating_sub(DEFAULT_LOOKBACK_BLOCKS)),
-    };
-
-    let end_height = tip;
-
-    if start_height > end_height {
-        // Nothing new to scan; apply empty batch to update confirmation thresholds if tip advanced
-        let _ = apply_detected(store, &[], tip, confirmations)?;
-    } else {
-        let range = BlockRange {
-            start: Some(BlockId {
-                height: start_height,
-                hash: vec![],
-            }),
-            end: Some(BlockId {
-                height: end_height,
-                hash: vec![],
-            }),
-            pool_types: vec![],
-        };
-
-        let mut stream = client
-            .get_block_range(tonic::Request::new(range))
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to request block range [{}..={}] from lightwalletd",
-                    start_height, end_height
-                )
-            })?
-            .into_inner();
-
-        let mut blocks_scanned: u64 = 0;
-        let mut detected_notes = Vec::new();
-        let mut prior_metadata: Option<BlockMetadata> = None;
-        let mut current_block_hashes = Vec::new();
-
-        while let Some(block) = stream
-            .message()
-            .await
-            .with_context(|| "Error receiving compact block from stream")?
-        {
-            let height = block.height;
-            let hash_hex = hex_encode(&block.hash);
-            current_block_hashes.push((height, hash_hex));
-
-            let (notes, metadata) = scan_compact_block(
-                network,
-                block,
-                scanning_keys,
-                nullifiers,
-                prior_metadata.as_ref(),
-                uivk,
-            )?;
-
-            detected_notes.extend(notes);
-            prior_metadata = Some(metadata);
-            blocks_scanned += 1;
-        }
-
-        // Check for reorganization and rollback if block hashes differ
-        let _ = check_and_rollback_reorg(store, &current_block_hashes)?;
-
-        // Apply detected notes to database
-        let result = apply_detected(store, &detected_notes, tip, confirmations)?;
-
-        // Update scan cursor in invoice_meta only after full pass success
-        store.set_last_scanned_height(end_height)?;
-
-        // Privacy rule: Never log addresses, txids, amounts, or keys. Print counts only.
-        println!(
-            "Scanned {} blocks ({}..={}), {} payments detected, {} invoices paid.",
-            blocks_scanned, start_height, end_height, result.payments_detected, result.invoices_paid
-        );
-    }
-
-    Ok(())
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -278,8 +148,16 @@ async fn main() -> Result<()> {
         .await;
 
         match pass_res {
-            Ok(Ok(())) => {
+            Ok(Ok(summary)) => {
                 backoff = INITIAL_BACKOFF;
+                println!(
+                    "Scanned {} blocks ({}..={}), {} payments detected, {} invoices paid.",
+                    summary.blocks_scanned,
+                    summary.start_height,
+                    summary.end_height,
+                    summary.payments_detected,
+                    summary.invoices_paid
+                );
                 if args.once {
                     break;
                 }
