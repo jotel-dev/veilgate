@@ -26,35 +26,61 @@
         }
     }
 
-    // --- Copy Address Helper ---
-    function initCopyButton() {
-        var copyBtn = document.getElementById('copy-address-btn');
-        if (!copyBtn) return;
+    // --- Copy Buttons Helper ---
+    function initCopyButtons() {
+        var buttons = [
+            document.getElementById('copy-address-btn'),
+            document.getElementById('copy-link-btn')
+        ];
 
-        copyBtn.addEventListener('click', function () {
-            var addr = copyBtn.getAttribute('data-address');
-            if (!addr) return;
+        buttons.forEach(function (btn) {
+            if (!btn) return;
+            btn.addEventListener('click', function () {
+                var text = btn.getAttribute('data-copy-text') || btn.getAttribute('data-address') || btn.getAttribute('data-uri');
+                if (!text) return;
 
-            navigator.clipboard.writeText(addr).then(function () {
-                var originalText = copyBtn.getAttribute('data-original-text') || 'Copy address';
-                copyBtn.textContent = 'Copied to clipboard!';
-                copyBtn.classList.add('btn-success');
-                setTimeout(function () {
-                    copyBtn.textContent = originalText;
-                    copyBtn.classList.remove('btn-success');
-                }, 2000);
-            }).catch(function () {
-                // Fallback selection if clipboard api fails
-                var addrElem = document.getElementById('shielded-address-text');
-                if (addrElem) {
-                    var range = document.createRange();
-                    range.selectNodeContents(addrElem);
-                    var sel = window.getSelection();
-                    sel.removeAllRanges();
-                    sel.addRange(range);
-                }
+                navigator.clipboard.writeText(text).then(function () {
+                    var originalHtml = btn.innerHTML;
+                    btn.textContent = 'Copied!';
+                    btn.classList.add('btn-success');
+                    setTimeout(function () {
+                        btn.innerHTML = originalHtml;
+                        btn.classList.remove('btn-success');
+                    }, 2000);
+                }).catch(function () {
+                    // Fallback selection if clipboard api fails
+                    var addrElem = document.getElementById('shielded-address-text');
+                    if (addrElem) {
+                        var range = document.createRange();
+                        range.selectNodeContents(addrElem);
+                        var sel = window.getSelection();
+                        sel.removeAllRanges();
+                        sel.addRange(range);
+                    }
+                });
             });
         });
+    }
+
+    // --- Remaining Time Countdown Helper ---
+    function updateRemainingTime() {
+        var elem = document.getElementById('pay-expiry-remaining');
+        if (!elem) return;
+        var expiresAt = parseInt(elem.getAttribute('data-expires-at'), 10);
+        if (!expiresAt) return;
+        var nowSec = Math.floor(Date.now() / 1000);
+        var diff = expiresAt - nowSec;
+        if (diff <= 0) {
+            elem.textContent = ' (expired)';
+        } else {
+            var hours = Math.floor(diff / 3600);
+            var mins = Math.floor((diff % 3600) / 60);
+            if (hours > 0) {
+                elem.textContent = ' (expires in ' + hours + ' h ' + mins + ' min)';
+            } else {
+                elem.textContent = ' (expires in ' + mins + ' min)';
+            }
+        }
     }
 
     // --- Format Zatoshis to ZEC ---
@@ -137,6 +163,7 @@
                     statusBadge.className = 'status-pill status-awaiting';
                     statusBadge.textContent = 'Awaiting payment';
                 }
+                updateRemainingTime();
             })
             .catch(function () {
                 // Silently ignore transient network poll errors
@@ -147,15 +174,17 @@
     }
 
     // --- DOM Ready Hook ---
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', function () {
-            initTheme();
-            initCopyButton();
-            initPaymentPolling();
-        });
-    } else {
+    function onReady() {
         initTheme();
-        initCopyButton();
+        initCopyButtons();
+        updateRemainingTime();
+        setInterval(updateRemainingTime, 5000);
         initPaymentPolling();
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', onReady);
+    } else {
+        onReady();
     }
 })();

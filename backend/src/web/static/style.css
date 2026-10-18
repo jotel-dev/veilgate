@@ -30,6 +30,7 @@
     --status-underpaid-text: #b91c1c;
     --status-expired-bg: #f1f5f9;
     --status-expired-text: #64748b;
+    --link-color: #0369a1;
     --hero-glow: radial-gradient(circle at 50% 50%, rgba(0, 210, 106, 0.12) 0%, rgba(0, 180, 216, 0.05) 50%, transparent 70%);
 }
 
@@ -43,8 +44,9 @@
         --border-color: #1a2742;
         --border-subtle: #141e33;
         --text-primary: #f8fafc;
-        --text-secondary: #94a3b8;
-        --text-muted: #64748b;
+        --text-secondary: #cbd5e1;
+        --text-muted: #94a3b8;
+        --link-color: #38bdf8;
         --card-shadow: 0 12px 30px -10px rgba(0, 0, 0, 0.6);
         --badge-bg: #064e3b;
         --badge-text: #6ee7b7;
@@ -88,6 +90,7 @@
     --status-underpaid-text: #b91c1c;
     --status-expired-bg: #f1f5f9;
     --status-expired-text: #64748b;
+    --link-color: #0369a1;
     --hero-glow: radial-gradient(circle at 50% 50%, rgba(0, 210, 106, 0.12) 0%, rgba(0, 180, 216, 0.05) 50%, transparent 70%);
 }
 
@@ -100,8 +103,9 @@
     --border-color: #1a2742;
     --border-subtle: #141e33;
     --text-primary: #f8fafc;
-    --text-secondary: #94a3b8;
-    --text-muted: #64748b;
+    --text-secondary: #cbd5e1;
+    --text-muted: #94a3b8;
+    --link-color: #38bdf8;
     --card-shadow: 0 12px 30px -10px rgba(0, 0, 0, 0.6);
     --badge-bg: #064e3b;
     --badge-text: #6ee7b7;
@@ -1108,4 +1112,94 @@ tr:last-child td {
     margin-top: 0.25rem;
     word-break: break-all;
 }
+
+/* Dashboard Header & Logout Form */
+.dashboard-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 1rem;
+    margin-bottom: 2rem;
+    position: relative;
+    z-index: 10;
+}
+
+#logout-form {
+    margin: 0;
+    display: inline-flex;
+}
+
+#logout-btn {
+    cursor: pointer;
+}
+
+/* Pay Page Hints & Faucet Help */
+#wallet-hint {
+    margin-top: 0.75rem;
+    margin-bottom: 1rem;
+    text-align: center;
+    font-size: 0.8125rem;
+    color: var(--text-secondary);
+}
+
+.faucet-help {
+    margin-top: 1.5rem;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    background-color: var(--bg-surface-subtle);
+    overflow: hidden;
+}
+
+.faucet-help summary {
+    padding: 0.75rem 1rem;
+    font-weight: 600;
+    font-size: 0.875rem;
+    color: var(--text-primary);
+    cursor: pointer;
+    background-color: var(--bg-surface-elevated);
+    border-bottom: 1px solid transparent;
+    user-select: none;
+}
+
+.faucet-help[open] summary {
+    border-bottom: 1px solid var(--border-color);
+}
+
+.faucet-help-content {
+    padding: 1rem;
+    font-size: 0.875rem;
+    color: var(--text-secondary);
+    line-height: 1.6;
+}
+
+.faucet-help-content p {
+    margin-bottom: 0.5rem;
+}
+
+.faucet-help-content ol {
+    margin: 0.75rem 0 0.75rem 1.25rem;
+    padding: 0;
+}
+
+.faucet-help-content li {
+    margin-bottom: 0.5rem;
+}
+
+.faucet-help-content a {
+    color: var(--link-color);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+
+.faucet-help-content a:hover {
+    color: var(--accent-green);
+}
+
+.faucet-disclaimer {
+    margin-top: 0.75rem;
+    font-size: 0.8125rem;
+    color: var(--text-muted);
+}
+
 

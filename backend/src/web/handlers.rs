@@ -559,9 +559,10 @@ pub async fn merchant_dashboard_get(
         _ => all_invoices.into_iter().filter(|i| !i.is_demo).collect(),
     };
 
+    let dashboard_items = build_dashboard_items(&state, filtered_invoices);
     let scanner_health = state.store.get_scanner_health().ok();
     let html = render_merchant_dashboard(
-        &filtered_invoices,
+        &dashboard_items,
         &session.csrf_token,
         None,
         state.repo_url.as_deref(),
@@ -569,6 +570,66 @@ pub async fn merchant_dashboard_get(
         scanner_health.as_ref(),
     );
     Html(html).into_response()
+}
+
+fn build_dashboard_items(
+    state: &AppState,
+    invoices: Vec<crate::invoices::Invoice>,
+) -> Vec<crate::web::templates::DashboardInvoiceItem> {
+    let chain_tip = state.store.get_chain_tip().ok().flatten().unwrap_or(0);
+    invoices
+        .into_iter()
+        .map(|inv| {
+            let pstate = state
+                .store
+                .invoice_payment_state(inv.address_index, chain_tip, state.confirmations)
+                .ok();
+            let payments = state
+                .store
+                .get_payments_for_invoice(inv.address_index)
+                .unwrap_or_default();
+            let total_received: u64 = payments.iter().map(|p| p.value_zatoshi).sum();
+            let (received, excess, state_name) = match inv.status {
+                crate::invoices::InvoiceStatus::Paid => {
+                    let name = if inv.is_late { "Paid late" } else { "Paid" };
+                    let excess = total_received.saturating_sub(inv.amount_zatoshi);
+                    (
+                        total_received.max(inv.amount_zatoshi),
+                        excess,
+                        name.to_string(),
+                    )
+                }
+                crate::invoices::InvoiceStatus::Expired => {
+                    let excess = total_received.saturating_sub(inv.amount_zatoshi);
+                    (total_received, excess, "Expired".to_string())
+                }
+                crate::invoices::InvoiceStatus::Pending => match pstate {
+                    Some(crate::scanner::InvoicePaymentState::Detected { received, .. }) => {
+                        let excess = received.saturating_sub(inv.amount_zatoshi);
+                        (received, excess, "Detected".to_string())
+                    }
+                    Some(crate::scanner::InvoicePaymentState::Underpaid { received, .. }) => {
+                        (received, 0, "Underpaid".to_string())
+                    }
+                    Some(crate::scanner::InvoicePaymentState::Paid {
+                        received,
+                        excess,
+                        late,
+                    }) => {
+                        let name = if late { "Paid late" } else { "Paid" };
+                        (received, excess, name.to_string())
+                    }
+                    _ => (0, 0, "Awaiting".to_string()),
+                },
+            };
+            crate::web::templates::DashboardInvoiceItem {
+                invoice: inv,
+                received_zatoshi: received,
+                excess_zatoshi: excess,
+                payment_state: state_name,
+            }
+        })
+        .collect()
 }
 
 /// `POST /merchant/invoices`
@@ -601,8 +662,9 @@ pub async fn merchant_create_invoice_post(
         Ok(z) => z,
         Err(_) => {
             let invoices = state.store.list_invoices().unwrap_or_default();
+            let items = build_dashboard_items(&state, invoices);
             let html = render_merchant_dashboard(
-                &invoices,
+                &items,
                 &session.csrf_token,
                 Some("Could not create the invoice. Please try again."),
                 state.repo_url.as_deref(),
@@ -629,8 +691,9 @@ pub async fn merchant_create_invoice_post(
         }
         Err(_) => {
             let invoices = state.store.list_invoices().unwrap_or_default();
+            let items = build_dashboard_items(&state, invoices);
             let html = render_merchant_dashboard(
-                &invoices,
+                &items,
                 &session.csrf_token,
                 Some("Could not create the invoice. Please try again."),
                 state.repo_url.as_deref(),

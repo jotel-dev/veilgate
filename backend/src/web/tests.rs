@@ -372,9 +372,12 @@ async fn test_rendered_pages_integrity_and_banned_words() {
         // No emojis
         assert!(!has_emoji(html), "Page '{}' contains emoji characters", name);
 
-        // No off-site URLs in href, src, etc.
+        // No off-site URLs in href, src, etc. (faucet links on demo are permitted)
+        let filtered_html = html
+            .replace(r#"href="https://faucet.testnet.valargroup.dev""#, "")
+            .replace(r#"href="https://fauzec.com""#, "");
         assert!(
-            !html.contains("href=\"http://") && !html.contains("href=\"https://"),
+            !filtered_html.contains("href=\"http://") && !filtered_html.contains("href=\"https://"),
             "Page '{}' contains off-site href link",
             name
         );
@@ -1511,7 +1514,7 @@ async fn test_scanner_panel_rendered_in_merchant_dashboard() {
     assert!(dash_html.contains("Blocks Behind"));
     assert!(dash_html.contains("6000"));
     assert!(dash_html.contains("Last Successful Scan"));
-    assert!(dash_html.contains("Unix 1720001234"));
+    assert!(dash_html.contains("2024-07-03 10:07 UTC"));
     assert!(dash_html.contains("Last Error Category"));
 
     // Verify HTML escaping
@@ -1564,4 +1567,247 @@ async fn test_public_pages_do_not_expose_scanner_health() {
         assert!(!body.contains("3126000"), "Found secret_tip in {endpoint}");
     }
 }
+
+// =========================================================================
+// Polish Pass Tests
+// =========================================================================
+
+#[test]
+fn test_utc_and_remaining_time_formatting() {
+    use crate::web::templates::{format_utc_timestamp, format_remaining_time};
+
+    assert_eq!(format_utc_timestamp(0), "1970-01-01 00:00 UTC");
+    assert_eq!(format_utc_timestamp(1720001234), "2024-07-03 10:07 UTC");
+    assert_eq!(format_utc_timestamp(1792364760), "2026-10-18 23:06 UTC");
+
+    assert_eq!(format_remaining_time(100, 200), "expires in 1 min");
+    assert_eq!(format_remaining_time(100, 7300), "expires in 2 h 0 min");
+    assert_eq!(format_remaining_time(100, 7360), "expires in 2 h 1 min");
+    assert_eq!(format_remaining_time(200, 100), "expired");
+    assert_eq!(format_remaining_time(100, 100), "expired");
+}
+
+#[tokio::test]
+async fn test_no_page_contains_the_word_unix() {
+    let (app, store, session_mgr, _lim, public_id, _pw) =
+        setup_test_app_custom(true, true, None);
+
+    store.set_last_scanned_height(3120000).unwrap();
+    store.set_chain_tip(3126000).unwrap();
+    store.set_last_success_unix_time(1720001234).unwrap();
+    store.set_last_error_category("none").unwrap();
+
+    let session = session_mgr.create_session();
+
+    let pay_uri = format!("/pay/{public_id}");
+    let pages = vec![
+        ("/", None),
+        ("/privacy", None),
+        ("/demo", None),
+        ("/merchant/login", None),
+        (pay_uri.as_str(), None),
+        ("/merchant?filter=all", Some(session.token.as_str())),
+    ];
+
+    for (path, cookie) in pages {
+        let mut builder = Request::builder().uri(path);
+        if let Some(tok) = cookie {
+            builder = builder.header(COOKIE, format!("{}={}", SESSION_COOKIE_NAME, tok));
+        }
+        let req = builder.body(Body::empty()).unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "Status failed on {path}");
+        let body = response_body_string(res).await;
+        assert!(
+            !body.contains("Unix"),
+            "Page {path} contains the word 'Unix'"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_no_page_names_orchard_pool_as_destination() {
+    let (app, _store, session_mgr, _lim, public_id, _pw) =
+        setup_test_app_custom(true, true, None);
+
+    let session = session_mgr.create_session();
+
+    let pay_uri = format!("/pay/{public_id}");
+    let pages = vec![
+        ("/", None),
+        ("/privacy", None),
+        ("/demo", None),
+        ("/merchant/login", None),
+        (pay_uri.as_str(), None),
+        ("/merchant?filter=all", Some(session.token.as_str())),
+    ];
+
+    for (path, cookie) in pages {
+        let mut builder = Request::builder().uri(path);
+        if let Some(tok) = cookie {
+            builder = builder.header(COOKIE, format!("{}={}", SESSION_COOKIE_NAME, tok));
+        }
+        let req = builder.body(Body::empty()).unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "Status failed on {path}");
+        let body = response_body_string(res).await;
+        assert!(
+            !body.contains("Orchard shielded pool"),
+            "Page {path} contains 'Orchard shielded pool'"
+        );
+        assert!(
+            !body.contains("Shielded Orchard address"),
+            "Page {path} contains 'Shielded Orchard address'"
+        );
+        assert!(
+            !body.contains("Orchard pool"),
+            "Page {path} contains 'Orchard pool'"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_demo_page_contains_no_offsite_script_or_image() {
+    let (app, _store, _pid, _pw) = setup_test_app(true);
+
+    let req = Request::builder().uri("/demo").body(Body::empty()).unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_body_string(res).await;
+
+    // Check all script tags
+    for part in body.split("<script").skip(1) {
+        if let Some(src_part) = part.split('>').next() {
+            if src_part.contains("src=") {
+                assert!(
+                    src_part.contains(r#"src="/static/"#),
+                    "Offsite script source found: {src_part}"
+                );
+                assert!(!src_part.contains("http://"), "Remote http script found: {src_part}");
+                assert!(!src_part.contains("https://"), "Remote https script found: {src_part}");
+                assert!(!src_part.contains(r#"src="//"#), "Protocol-relative script found: {src_part}");
+            }
+        }
+    }
+
+    // Check all img tags
+    for part in body.split("<img").skip(1) {
+        if let Some(src_part) = part.split('>').next() {
+            if src_part.contains("src=") {
+                assert!(
+                    src_part.contains(r#"src="/static/"#) || src_part.contains(r#"src="/favicon"#),
+                    "Offsite img source found: {src_part}"
+                );
+                assert!(!src_part.contains("http://"), "Remote http img found: {src_part}");
+                assert!(!src_part.contains("https://"), "Remote https img found: {src_part}");
+                assert!(!src_part.contains(r#"src="//"#), "Protocol-relative img found: {src_part}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_faucet_links_carry_rel_noopener_noreferrer() {
+    let (app, _store, public_id, _pw) = setup_test_app(true);
+
+    let test_uris = vec!["/demo".to_string(), format!("/pay/{public_id}")];
+
+    for uri in test_uris {
+        let req = Request::builder().uri(&uri).body(Body::empty()).unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = response_body_string(res).await;
+
+        assert!(
+            body.contains("https://faucet.testnet.valargroup.dev"),
+            "Missing valargroup faucet link in {uri}"
+        );
+        assert!(
+            body.contains("https://fauzec.com"),
+            "Missing fauzec link in {uri}"
+        );
+
+        // Check for rel="noopener noreferrer" and target="_blank"
+        assert!(
+            body.contains(r#"href="https://faucet.testnet.valargroup.dev" target="_blank" rel="noopener noreferrer""#),
+            "Valargroup faucet link missing required attributes in {uri}"
+        );
+        assert!(
+            body.contains(r#"href="https://fauzec.com" target="_blank" rel="noopener noreferrer""#),
+            "Fauzec link missing required attributes in {uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_copy_payment_link_button_exists_on_pay_page() {
+    let (app, _store, public_id, _pw) = setup_test_app(true);
+
+    let req = Request::builder()
+        .uri(format!("/pay/{public_id}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_body_string(res).await;
+
+    assert!(body.contains("id=\"copy-link-btn\""));
+    assert!(body.contains("Copy payment link"));
+    assert!(body.contains("id=\"wallet-hint\""));
+    assert!(body.contains("Opens a Zcash wallet app that supports payment links. If nothing happens, scan the QR code or copy the address."));
+}
+
+#[tokio::test]
+async fn test_logout_button_present_in_dashboard() {
+    let (app, _store, session_mgr, _lim, _pid, _pw) =
+        setup_test_app_custom(true, true, None);
+
+    let session = session_mgr.create_session();
+    let req = Request::builder()
+        .uri("/merchant")
+        .header(COOKIE, format!("{}={}", SESSION_COOKIE_NAME, session.token))
+        .body(Body::empty())
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_body_string(res).await;
+
+    assert!(body.contains("id=\"logout-btn\""));
+    assert!(body.contains("Log out"));
+    assert!(body.contains("id=\"logout-form\""));
+    assert!(body.contains("class=\"dashboard-header\""));
+}
+
+#[tokio::test]
+async fn test_dashboard_columns_and_payment_states() {
+    let (app, _store, session_mgr, _lim, _pid, _pw) =
+        setup_test_app_custom(true, true, None);
+
+    let session = session_mgr.create_session();
+    let req = Request::builder()
+        .uri("/merchant?filter=all")
+        .header(COOKIE, format!("{}={}", SESSION_COOKIE_NAME, session.token))
+        .body(Body::empty())
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_body_string(res).await;
+
+    // Verify columns exist in table header
+    assert!(body.contains("<th>Invoice ID</th>"));
+    assert!(body.contains("<th>Type</th>"));
+    assert!(body.contains("<th>Amount</th>"));
+    assert!(body.contains("<th>Received</th>"));
+    assert!(body.contains("<th>Excess</th>"));
+    assert!(body.contains("<th>State</th>"));
+    assert!(body.contains("<th>Created</th>"));
+    assert!(body.contains("<th>Action</th>"));
+
+    // Verify payment state badge classes and names exist
+    assert!(body.contains("status-awaiting"));
+    assert!(body.contains("Awaiting"));
+}
+
 

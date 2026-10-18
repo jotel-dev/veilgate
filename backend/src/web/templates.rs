@@ -8,9 +8,10 @@
 //! - Mobile-first responsive structure
 
 use std::borrow::Cow;
+use std::time::{SystemTime, UNIX_EPOCH};
 use crate::web::amount::format_zec_display;
 use crate::web::icons;
-use crate::invoices::{Invoice, ScannerHealth};
+use crate::invoices::{Invoice, InvoiceStatus, ScannerHealth};
 
 /// Escapes HTML special characters: `&`, `<`, `>`, `"`, and `'`.
 pub fn esc(s: &str) -> String {
@@ -26,6 +27,97 @@ pub fn esc(s: &str) -> String {
         }
     }
     out
+}
+
+/// Formats a Unix timestamp (seconds since epoch) as "YYYY-MM-DD HH:MM UTC".
+pub fn format_utc_timestamp(timestamp: u64) -> String {
+    let secs_of_day = (timestamp % 86400) as u32;
+    let hours = secs_of_day / 3600;
+    let minutes = (secs_of_day % 3600) / 60;
+
+    let mut days = (timestamp / 86400) as i64;
+    let mut year = 1970;
+    loop {
+        let leap = is_leap_year(year);
+        let days_in_year = if leap { 366 } else { 365 };
+        if days >= days_in_year {
+            days -= days_in_year;
+            year += 1;
+        } else {
+            break;
+        }
+    }
+    let leap = is_leap_year(year);
+    let days_in_months = [
+        31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+    ];
+    let mut month = 1;
+    for &dim in &days_in_months {
+        if days >= dim {
+            days -= dim;
+            month += 1;
+        } else {
+            break;
+        }
+    }
+    let day = days + 1;
+    format!("{year:04}-{month:02}-{day:02} {hours:02}:{minutes:02} UTC")
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+/// Formats remaining time until expiration as e.g. "expires in 1 h 52 min" or "expires in 15 min".
+pub fn format_remaining_time(now_secs: u64, expires_at: u64) -> String {
+    if expires_at <= now_secs {
+        "expired".to_string()
+    } else {
+        let diff = expires_at - now_secs;
+        let hours = diff / 3600;
+        let mins = (diff % 3600) / 60;
+        if hours > 0 {
+            format!("expires in {hours} h {mins} min")
+        } else {
+            format!("expires in {mins} min")
+        }
+    }
+}
+
+/// Item representing an invoice row in the merchant dashboard with computed payment state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DashboardInvoiceItem {
+    pub invoice: Invoice,
+    pub received_zatoshi: u64,
+    pub excess_zatoshi: u64,
+    pub payment_state: String,
+}
+
+impl From<Invoice> for DashboardInvoiceItem {
+    fn from(inv: Invoice) -> Self {
+        let state = match inv.status {
+            InvoiceStatus::Paid => {
+                if inv.is_late {
+                    "Paid late".to_string()
+                } else {
+                    "Paid".to_string()
+                }
+            }
+            InvoiceStatus::Pending => "Awaiting".to_string(),
+            InvoiceStatus::Expired => "Expired".to_string(),
+        };
+        let (received, excess) = if inv.status == InvoiceStatus::Paid {
+            (inv.amount_zatoshi, 0)
+        } else {
+            (0, 0)
+        };
+        Self {
+            invoice: inv,
+            received_zatoshi: received,
+            excess_zatoshi: excess,
+            payment_state: state,
+        }
+    }
 }
 
 /// Base HTML layout wrapper.
@@ -299,7 +391,34 @@ pub fn render_pay_page<'a>(
     let public_id_esc = esc(&invoice.public_id);
     let address_esc = esc(&invoice.address);
     let zip321_uri_esc = esc(zip321_uri);
-    let expiry_str = esc(&format!("Unix {}", invoice.expires_at));
+    let expiry_utc = esc(&format_utc_timestamp(invoice.expires_at));
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let remaining_text = if invoice.status == InvoiceStatus::Pending && invoice.expires_at > now_secs {
+        format!(" ({})", format_remaining_time(now_secs, invoice.expires_at))
+    } else {
+        String::new()
+    };
+    let remaining_text_esc = esc(&remaining_text);
+
+    let faucet_help_html = if invoice.status == InvoiceStatus::Pending {
+        r#"<details class="faucet-help" id="how-to-pay-section">
+            <summary>How to pay on testnet</summary>
+            <div class="faucet-help-content">
+                <p>To pay this invoice on the Zcash testnet:</p>
+                <ol>
+                    <li><strong>Zcash testnet wallet:</strong> Use a wallet that supports the Zcash testnet and scan the QR code or click &ldquo;Open in wallet&rdquo;.</li>
+                    <li><strong>No testnet wallet:</strong> Paste the invoice address into a public testnet faucet, for example <a href="https://faucet.testnet.valargroup.dev" target="_blank" rel="noopener noreferrer">faucet.testnet.valargroup.dev</a> or <a href="https://fauzec.com" target="_blank" rel="noopener noreferrer">fauzec.com</a>, which will pay the address directly (typical drips are 0.1 to 1 TAZ, so use small demo invoices).</li>
+                </ol>
+                <p class="form-help">These are third-party sites we do not control and that may be paused or rate limited.</p>
+            </div>
+        </details>"#
+    } else {
+        ""
+    };
 
     let content = format!(
         r#"<div class="container">
@@ -325,19 +444,25 @@ pub fn render_pay_page<'a>(
             <a href="{zip321_uri}" class="btn-primary" id="open-in-wallet-btn">
                 {link_icon} <span>Open in wallet</span>
             </a>
-            <button type="button" class="btn-secondary" id="copy-address-btn" data-address="{address}" data-original-text="Copy address">
+            <button type="button" class="btn-secondary" id="copy-address-btn" data-copy-text="{address}" data-address="{address}" data-original-text="Copy address">
                 {copy_icon} <span>Copy address</span>
             </button>
+            <button type="button" class="btn-secondary" id="copy-link-btn" data-copy-text="{zip321_uri}" data-uri="{zip321_uri}" data-original-text="Copy payment link">
+                {link_icon} <span>Copy payment link</span>
+            </button>
         </div>
+        <p class="form-help form-help-hint" id="wallet-hint">Opens a Zcash wallet app that supports payment links. If nothing happens, scan the QR code or copy the address.</p>
+
+        {faucet_help_html}
 
         <div class="form-group">
-            <label class="form-label" for="shielded-address-text">Shielded Orchard address</label>
+            <label class="form-label" for="shielded-address-text">Shielded address</label>
             <div class="address-box" id="shielded-address-text">{address}</div>
         </div>
 
         <div class="check-row">
-            <div class="check-item">{clock_icon} <span>Expires at: {expiry_str}</span></div>
-            <div class="check-item">{shield_icon} <span>Orchard shielded pool</span></div>
+            <div class="check-item">{clock_icon} <span>Expires at: {expiry_utc}<span id="pay-expiry-remaining" data-expires-at="{expires_at}">{remaining_text}</span></span></div>
+            <div class="check-item">{shield_icon} <span>Shielded address</span></div>
         </div>
 
         <div class="privacy-panel">
@@ -346,6 +471,7 @@ pub fn render_pay_page<'a>(
                 <li><strong>What this page does NOT do:</strong> 0 third-party trackers, 0 external web fonts, 0 remote scripts, 0 analytics. Does not record your IP or store customer identities.</li>
                 <li><strong>What the merchant sees:</strong> That this invoice was visited, the payment amount and confirmation count once mined into a block, and any memo included by your wallet.</li>
                 <li><strong>Network privacy:</strong> The merchant server sees HTTP connections to this invoice URL. Use Tor or a trusted VPN if you need network-level IP privacy against the host.</li>
+                <li><strong>Pools &amp; receivers:</strong> The invoice address has an Orchard receiver; on the current network payments to it are recorded in the Ironwood pool.</li>
             </ul>
         </div>
     </div>
@@ -359,7 +485,10 @@ pub fn render_pay_page<'a>(
         received_formatted = received_formatted,
         qr_svg = qr_svg,
         zip321_uri = zip321_uri_esc,
-        expiry_str = expiry_str,
+        expiry_utc = expiry_utc,
+        expires_at = invoice.expires_at,
+        remaining_text = remaining_text_esc,
+        faucet_help_html = faucet_help_html,
         link_icon = icons::LINK,
         copy_icon = icons::COPY,
         clock_icon = icons::CLOCK,
@@ -400,6 +529,11 @@ pub fn render_privacy_page(repo_url: Option<&str>, has_session: bool) -> String 
         </div>
 
         <div class="privacy-panel">
+            <h4>Pools and receivers</h4>
+            <p>Each invoice address has an Orchard receiver, and on the current network payments to it are recorded in the Ironwood pool.</p>
+        </div>
+
+        <div class="privacy-panel">
             <h4>Known limitations</h4>
             <ul>
                 <li><strong>Testnet only:</strong> VeilGate operates strictly on Zcash testnet.</li>
@@ -430,13 +564,13 @@ pub fn render_demo_page(csrf_token: &str, error_msg: Option<&str>, repo_url: Opt
     <div class="checkout-card">
         <span class="eyebrow">TESTNET DEMO</span>
         <h1>Create a Testnet Invoice</h1>
-        <p class="hero-subtext">Test VeilGate checkout in real-time. Enter an amount between 0.001 and 10 ZEC to derive a fresh shielded Orchard testnet address.</p>
+        <p class="hero-subtext">Test VeilGate checkout in real-time. Enter an amount between 0.001 and 10 ZEC to derive a fresh shielded testnet address.</p>
         {error_html}
         <form method="POST" action="/demo" id="demo-form">
             <input type="hidden" name="csrf_token" value="{csrf_token}">
             <div class="form-group">
                 <label class="form-label" for="demo-amount">Amount (ZEC)</label>
-                <input class="form-input" type="text" id="demo-amount" name="amount" placeholder="1.5" required>
+                <input class="form-input" type="text" id="demo-amount" name="amount" value="0.1" placeholder="0.1" required>
                 <div class="form-help">Allowed range: 0.001 to 10 ZEC (testnet)</div>
             </div>
             <div class="form-group">
@@ -446,6 +580,18 @@ pub fn render_demo_page(csrf_token: &str, error_msg: Option<&str>, repo_url: Opt
             </div>
             <button type="submit" class="btn-primary" id="demo-submit-btn">Create Testnet Invoice</button>
         </form>
+
+        <details class="faucet-help" id="how-to-pay-section">
+            <summary>How to pay on testnet</summary>
+            <div class="faucet-help-content">
+                <p>To test payment on the Zcash testnet:</p>
+                <ol>
+                    <li><strong>Zcash testnet wallet:</strong> Use a wallet that supports the Zcash testnet and scan the QR code or click &ldquo;Open in wallet&rdquo;.</li>
+                    <li><strong>No testnet wallet:</strong> Paste the invoice address into a public testnet faucet, for example <a href="https://faucet.testnet.valargroup.dev" target="_blank" rel="noopener noreferrer">faucet.testnet.valargroup.dev</a> or <a href="https://fauzec.com" target="_blank" rel="noopener noreferrer">fauzec.com</a>, which will pay the address directly (typical drips are 0.1 to 1 TAZ, so use small demo invoices).</li>
+                </ol>
+                <p class="form-help">These are third-party sites we do not control and that may be paused or rate limited.</p>
+            </div>
+        </details>
     </div>
 </div>"#,
         error_html = error_html,
@@ -490,7 +636,7 @@ pub fn render_login_page(csrf_token: &str, error_msg: Option<&str>, repo_url: Op
 
 /// Renders Merchant Dashboard (`GET /merchant`).
 pub fn render_merchant_dashboard(
-    invoices: &[Invoice],
+    invoices: &[DashboardInvoiceItem],
     csrf_token: &str,
     error_msg: Option<&str>,
     repo_url: Option<&str>,
@@ -516,7 +662,7 @@ pub fn render_merchant_dashboard(
             let behind = esc(&h.blocks_behind.to_string());
             let ls_time = h
                 .last_success_unix_time
-                .map(|t| esc(&format!("Unix {t}")))
+                .map(|t| esc(&format_utc_timestamp(t)))
                 .unwrap_or_else(|| "Never".to_string());
             let err = h
                 .last_error_category
@@ -564,12 +710,15 @@ pub fn render_merchant_dashboard(
 
     let csrf_token_esc = esc(csrf_token);
     let total_invoices = invoices.len();
-    let total_volume_zatoshi: u64 = invoices.iter().map(|i| i.amount_zatoshi).sum();
-    let total_paid_count = invoices.iter().filter(|i| i.status == crate::invoices::InvoiceStatus::Paid).count();
+    let total_volume_zatoshi: u64 = invoices.iter().map(|i| i.invoice.amount_zatoshi).sum();
+    let total_paid_count = invoices
+        .iter()
+        .filter(|i| i.invoice.status == InvoiceStatus::Paid)
+        .count();
     let total_paid_zatoshi: u64 = invoices
         .iter()
-        .filter(|i| i.status == crate::invoices::InvoiceStatus::Paid)
-        .map(|i| i.amount_zatoshi)
+        .filter(|i| i.invoice.status == InvoiceStatus::Paid)
+        .map(|i| i.invoice.amount_zatoshi)
         .sum();
 
     let total_volume = esc(&format_zec_display(total_volume_zatoshi));
@@ -581,22 +730,21 @@ pub fn render_merchant_dashboard(
     let filter_demo_cls = if current_filter == "demo" { "btn-secondary active-filter" } else { "btn-secondary" };
 
     let mut table_rows = String::new();
-    for inv in invoices {
-        let status_badge = match inv.status {
-            crate::invoices::InvoiceStatus::Paid => {
-                if inv.is_late {
-                    r#"<span class="status-pill status-paid">Paid (late)</span>"#
-                } else {
-                    r#"<span class="status-pill status-paid">Paid</span>"#
-                }
-            }
-            crate::invoices::InvoiceStatus::Pending => {
-                r#"<span class="status-pill status-awaiting">Pending</span>"#
-            }
-            crate::invoices::InvoiceStatus::Expired => {
-                r#"<span class="status-pill status-expired">Expired</span>"#
-            }
+    for item in invoices {
+        let inv = &item.invoice;
+        let state_name = &item.payment_state;
+        let state_class = match state_name.as_str() {
+            "Paid" | "Paid late" => "status-paid",
+            "Detected" => "status-detected",
+            "Underpaid" => "status-underpaid",
+            "Expired" => "status-expired",
+            _ => "status-awaiting",
         };
+        let status_badge = format!(
+            r#"<span class="status-pill {}">{}</span>"#,
+            state_class,
+            esc(state_name)
+        );
 
         let type_badge = if inv.is_demo {
             r#"<span class="status-pill status-demo">Demo</span>"#
@@ -608,32 +756,39 @@ pub fn render_merchant_dashboard(
         let short_len = std::cmp::min(8, inv.public_id.len());
         let public_id_short_esc = esc(&inv.public_id[..short_len]);
         let amount_esc = esc(&format_zec_display(inv.amount_zatoshi));
+        let received_esc = esc(&format_zec_display(item.received_zatoshi));
+        let excess_esc = esc(&format_zec_display(item.excess_zatoshi));
+        let created_utc = esc(&format_utc_timestamp(inv.created_at));
 
         table_rows.push_str(&format!(
             r#"<tr>
                 <td><a href="/pay/{public_id}"><code>{public_id_short}</code></a></td>
                 <td>{type_badge}</td>
                 <td>{amount}</td>
+                <td>{received}</td>
+                <td>{excess}</td>
                 <td>{status}</td>
-                <td>Unix {created_at}</td>
+                <td>{created_at}</td>
                 <td><a href="/pay/{public_id}" class="btn-secondary">View pay page</a></td>
             </tr>"#,
             public_id = public_id_esc,
             public_id_short = public_id_short_esc,
             type_badge = type_badge,
             amount = amount_esc,
+            received = received_esc,
+            excess = excess_esc,
             status = status_badge,
-            created_at = inv.created_at,
+            created_at = created_utc,
         ));
     }
 
     if table_rows.is_empty() {
-        table_rows = r#"<tr><td colspan="6" class="form-help">No invoices found for this view.</td></tr>"#.to_string();
+        table_rows = r#"<tr><td colspan="8" class="form-help">No invoices found for this view.</td></tr>"#.to_string();
     }
 
     let content = format!(
         r#"<div class="container">
-    <div class="mockup-header">
+    <div class="dashboard-header">
         <div>
             <span class="eyebrow">MERCHANT DASHBOARD</span>
             <h1>Invoices</h1>
@@ -697,7 +852,9 @@ pub fn render_merchant_dashboard(
                     <th>Invoice ID</th>
                     <th>Type</th>
                     <th>Amount</th>
-                    <th>Status</th>
+                    <th>Received</th>
+                    <th>Excess</th>
+                    <th>State</th>
                     <th>Created</th>
                     <th>Action</th>
                 </tr>

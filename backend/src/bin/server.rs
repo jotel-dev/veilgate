@@ -301,6 +301,9 @@ async fn main() -> Result<()> {
         }
     };
 
+    let bound_addr = listener.local_addr()?;
+    println!("VeilGate listening on http://{}", bound_addr);
+
     let cursor_str = match store.get_last_scanned_height()? {
         Some(h) => h.to_string(),
         None => "none".to_string(),
