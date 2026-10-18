@@ -1067,6 +1067,7 @@ async fn test_fix9_html_escaping() {
         Some("<bad'err\"&>"),
         None,
         Some("all"),
+        None,
     );
     assert!(!dash_html.contains("<bad'err\"&>"));
     assert!(dash_html.contains("&lt;bad&#x27;err&quot;&amp;&gt;"));
@@ -1446,6 +1447,121 @@ async fn test_fix14_csp_clean_attributes() {
 
         // 3. Must not contain any on*= event attribute
         assert_no_on_event_attributes(&body, &endpoint);
+    }
+}
+
+#[tokio::test]
+async fn test_scanner_health_storage_and_retrieval() {
+    let store = open_store(":memory:").expect("open store");
+
+    // Initially unset
+    assert_eq!(store.get_last_success_unix_time().unwrap(), None);
+    assert_eq!(store.get_last_error_category().unwrap(), None);
+
+    let initial_health = store.get_scanner_health().unwrap();
+    assert_eq!(initial_health.last_scanned_block, None);
+    assert_eq!(initial_health.chain_tip, None);
+    assert_eq!(initial_health.blocks_behind, 0);
+    assert_eq!(initial_health.last_success_unix_time, None);
+    assert_eq!(initial_health.last_error_category, None);
+
+    // Update values
+    store.set_last_scanned_height(3120000).unwrap();
+    store.set_chain_tip(3126000).unwrap();
+    store.set_last_success_unix_time(1720001234).unwrap();
+    store.set_last_error_category("timeout").unwrap();
+
+    assert_eq!(store.get_last_success_unix_time().unwrap(), Some(1720001234));
+    assert_eq!(store.get_last_error_category().unwrap(), Some("timeout".to_string()));
+
+    let health = store.get_scanner_health().unwrap();
+    assert_eq!(health.last_scanned_block, Some(3120000));
+    assert_eq!(health.chain_tip, Some(3126000));
+    assert_eq!(health.blocks_behind, 6000);
+    assert_eq!(health.last_success_unix_time, Some(1720001234));
+    assert_eq!(health.last_error_category, Some("timeout".to_string()));
+}
+
+#[tokio::test]
+async fn test_scanner_panel_rendered_in_merchant_dashboard() {
+    let health = crate::invoices::ScannerHealth {
+        last_scanned_block: Some(3120000),
+        chain_tip: Some(3126000),
+        blocks_behind: 6000,
+        last_success_unix_time: Some(1720001234),
+        last_error_category: Some("<timeout>&injection".to_string()),
+    };
+
+    let dash_html = templates::render_merchant_dashboard(
+        &[],
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        None,
+        None,
+        Some("all"),
+        Some(&health),
+    );
+
+    // Verify presence of Scanner panel and all stats
+    assert!(dash_html.contains("id=\"scanner-health-panel\""));
+    assert!(dash_html.contains("<h3>Scanner</h3>"));
+    assert!(dash_html.contains("Last Scanned Block"));
+    assert!(dash_html.contains("3120000"));
+    assert!(dash_html.contains("Chain Tip"));
+    assert!(dash_html.contains("3126000"));
+    assert!(dash_html.contains("Blocks Behind"));
+    assert!(dash_html.contains("6000"));
+    assert!(dash_html.contains("Last Successful Scan"));
+    assert!(dash_html.contains("Unix 1720001234"));
+    assert!(dash_html.contains("Last Error Category"));
+
+    // Verify HTML escaping
+    assert!(!dash_html.contains("<timeout>&injection"));
+    assert!(dash_html.contains("&lt;timeout&gt;&amp;injection"));
+}
+
+#[tokio::test]
+async fn test_public_pages_do_not_expose_scanner_health() {
+    let (app, store, _session_mgr, _limiter, public_id, _password) =
+        setup_test_app_custom(true, true, None);
+
+    // Set distinctive scanner health info in the store
+    let secret_block = 3120000;
+    let secret_tip = 3126000;
+    let secret_time = 1720001234;
+    let secret_error = "secret_db_failure_marker";
+
+    store.set_last_scanned_height(secret_block).unwrap();
+    store.set_chain_tip(secret_tip).unwrap();
+    store.set_last_success_unix_time(secret_time).unwrap();
+    store.set_last_error_category(secret_error).unwrap();
+
+    let public_endpoints = vec![
+        format!("/pay/{public_id}"),
+        format!("/api/invoice/{public_id}/status"),
+        "/demo".to_string(),
+        "/".to_string(),
+        "/privacy".to_string(),
+    ];
+
+    for endpoint in public_endpoints {
+        let req = Request::builder()
+            .uri(&endpoint)
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "Failed on endpoint {endpoint}");
+
+        let body = response_body_string(res).await;
+
+        assert!(!body.contains("scanner-health-panel"), "Found scanner-health-panel in {endpoint}");
+        assert!(!body.contains("Last Scanned Block"), "Found Last Scanned Block in {endpoint}");
+        assert!(!body.contains("Chain Tip"), "Found Chain Tip in {endpoint}");
+        assert!(!body.contains("Blocks Behind"), "Found Blocks Behind in {endpoint}");
+        assert!(!body.contains("Last Successful Scan"), "Found Last Successful Scan in {endpoint}");
+        assert!(!body.contains("Last Error Category"), "Found Last Error Category in {endpoint}");
+        assert!(!body.contains(secret_error), "Found secret_error in {endpoint}");
+        assert!(!body.contains("3120000"), "Found secret_block in {endpoint}");
+        assert!(!body.contains("3126000"), "Found secret_tip in {endpoint}");
     }
 }
 

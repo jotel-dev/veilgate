@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use rusqlite::params;
 use rusqlite::OptionalExtension;
 use tonic::transport::Channel;
@@ -24,6 +25,116 @@ pub const DEFAULT_REORG_DEPTH: u64 = 20;
 
 /// Default lookback block count for a fresh database without a recorded cursor.
 pub const DEFAULT_LOOKBACK_BLOCKS: u64 = 100;
+
+/// Number of blocks to process per chunk during scan catch-up.
+pub const CHUNK_BLOCKS: u64 = 500;
+
+/// Maximum duration allowed for scanning a single chunk before timing out.
+pub const CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Pure function dividing a block height range into sequential chunks of at most `size` blocks.
+///
+/// Returns an empty vector if `start > end` or `size == 0`.
+pub fn plan_chunks(start: u64, end: u64, size: u64) -> Vec<(u64, u64)> {
+    if start > end || size == 0 {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut current_start = start;
+    while current_start <= end {
+        let chunk_end = std::cmp::min(current_start.saturating_add(size.saturating_sub(1)), end);
+        chunks.push((current_start, chunk_end));
+        if chunk_end == end {
+            break;
+        }
+        current_start = chunk_end + 1;
+    }
+    chunks
+}
+
+/// Categorization of scanner failures to prevent leakage of sensitive data in logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanErrorKind {
+    Connect,
+    Timeout,
+    Stream,
+    ScanBlock { height: u64 },
+    Database,
+    Other,
+}
+
+impl ScanErrorKind {
+    pub fn category(&self) -> String {
+        match self {
+            Self::Connect => "connect".to_string(),
+            Self::Timeout => "timeout".to_string(),
+            Self::Stream => "stream".to_string(),
+            Self::ScanBlock { height } => format!("scan_block at height {height}"),
+            Self::Database => "database".to_string(),
+            Self::Other => "other".to_string(),
+        }
+    }
+}
+
+/// Structured error for payment scanning operations.
+#[derive(Debug)]
+pub struct ScanError {
+    pub kind: ScanErrorKind,
+    pub source: Option<anyhow::Error>,
+}
+
+impl ScanError {
+    pub fn connect(e: impl Into<anyhow::Error>) -> Self {
+        Self {
+            kind: ScanErrorKind::Connect,
+            source: Some(e.into()),
+        }
+    }
+    pub fn timeout() -> Self {
+        Self {
+            kind: ScanErrorKind::Timeout,
+            source: None,
+        }
+    }
+    pub fn stream(e: impl Into<anyhow::Error>) -> Self {
+        Self {
+            kind: ScanErrorKind::Stream,
+            source: Some(e.into()),
+        }
+    }
+    pub fn scan_block(height: u64, e: impl Into<anyhow::Error>) -> Self {
+        Self {
+            kind: ScanErrorKind::ScanBlock { height },
+            source: Some(e.into()),
+        }
+    }
+    pub fn database(e: impl Into<anyhow::Error>) -> Self {
+        Self {
+            kind: ScanErrorKind::Database,
+            source: Some(e.into()),
+        }
+    }
+    pub fn other(e: impl Into<anyhow::Error>) -> Self {
+        Self {
+            kind: ScanErrorKind::Other,
+            source: Some(e.into()),
+        }
+    }
+}
+
+impl std::fmt::Display for ScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.kind.category())
+    }
+}
+
+impl std::error::Error for ScanError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|e| e.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
 
 /// Represents a decrypted note output matching one of our merchant invoice addresses.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -503,10 +614,99 @@ pub struct ScanPassSummary {
     pub invoices_paid: usize,
 }
 
-/// Executes a single scan pass across the lightwalletd compact block stream.
+/// Scans a single bounded block range (chunk), checks for reorgs, applies detected notes,
+/// and updates the scan cursor and success timestamp to `chunk_end`.
+pub async fn scan_single_chunk(
+    client: &mut CompactTxStreamerClient<Channel>,
+    store: &Store,
+    network: &Network,
+    scanning_keys: &ScanningKeys<u32, u32>,
+    nullifiers: &Nullifiers<u32>,
+    uivk: &UnifiedIncomingViewingKey,
+    confirmations: u32,
+    chunk_start: u64,
+    chunk_end: u64,
+    tip: u64,
+) -> Result<(u64, usize, usize), ScanError> {
+    let range = BlockRange {
+        start: Some(BlockId {
+            height: chunk_start,
+            hash: vec![],
+        }),
+        end: Some(BlockId {
+            height: chunk_end,
+            hash: vec![],
+        }),
+        pool_types: vec![],
+    };
+
+    let mut stream = client
+        .get_block_range(tonic::Request::new(range))
+        .await
+        .map_err(ScanError::stream)?
+        .into_inner();
+
+    let mut blocks_scanned: u64 = 0;
+    let mut detected_notes = Vec::new();
+    let mut prior_metadata: Option<BlockMetadata> = None;
+    let mut current_block_hashes = Vec::new();
+
+    loop {
+        let block_opt = stream.message().await.map_err(ScanError::stream)?;
+        let block = match block_opt {
+            Some(b) => b,
+            None => break,
+        };
+
+        let height = block.height;
+        let hash_hex = hex_encode(&block.hash);
+        current_block_hashes.push((height, hash_hex));
+
+        let (notes, metadata) = scan_compact_block(
+            network,
+            block,
+            scanning_keys,
+            nullifiers,
+            prior_metadata.as_ref(),
+            uivk,
+        )
+        .map_err(|e| ScanError::scan_block(height, e))?;
+
+        detected_notes.extend(notes);
+        prior_metadata = Some(metadata);
+        blocks_scanned += 1;
+    }
+
+    // Check for reorganization and rollback if block hashes differ
+    check_and_rollback_reorg(store, &current_block_hashes)
+        .map_err(ScanError::database)?;
+
+    // Apply detected notes to database
+    let result = apply_detected(store, &detected_notes, tip, confirmations)
+        .map_err(ScanError::database)?;
+
+    // Update scan cursor in invoice_meta to the end of THAT chunk
+    store
+        .set_last_scanned_height(chunk_end)
+        .map_err(ScanError::database)?;
+
+    // Record last successful scan time in invoice_meta
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    store
+        .set_last_success_unix_time(now)
+        .map_err(ScanError::database)?;
+
+    Ok((blocks_scanned, result.payments_detected, result.invoices_paid))
+}
+
+/// Executes a scan pass across the lightwalletd compact block stream in chunks of 500 blocks.
 ///
 /// Records the server chain tip in `invoice_meta` under key `'chain_tip'`.
-/// Updates `last_scanned_height` in `invoice_meta` ONLY upon full pass completion.
+/// Each chunk updates `last_scanned_height` in `invoice_meta` immediately upon completion,
+/// ensuring forward progress is preserved across timeouts or network interruptions.
 pub async fn run_scan_pass(
     client: &mut CompactTxStreamerClient<Channel>,
     store: &Store,
@@ -516,25 +716,26 @@ pub async fn run_scan_pass(
     uivk: &UnifiedIncomingViewingKey,
     confirmations: u32,
     from_height: Option<u64>,
-) -> Result<ScanPassSummary> {
+) -> Result<ScanPassSummary, ScanError> {
     let info = client
         .get_lightd_info(tonic::Request::new(Empty {}))
         .await
-        .with_context(|| "Failed to query get_lightd_info from server")?
+        .map_err(ScanError::connect)?
         .into_inner();
 
     if info.chain_name != "test" {
-        return Err(anyhow!(
+        let err = ScanError::other(anyhow!(
             "Connected server chain is '{}', but TESTNET ('test') is strictly required",
             info.chain_name
         ));
+        let _ = store.set_last_error_category(&err.kind.category());
+        return Err(err);
     }
 
-    let tip = info.block_height;
-    // Record current chain tip in invoice_meta
-    store.set_chain_tip(tip)?;
+    let mut current_tip = info.block_height;
+    store.set_chain_tip(current_tip).map_err(ScanError::database)?;
 
-    let last_scanned = store.get_last_scanned_height()?;
+    let last_scanned = store.get_last_scanned_height().map_err(ScanError::database)?;
 
     let start_height = match last_scanned {
         Some(last) => {
@@ -548,88 +749,92 @@ pub async fn run_scan_pass(
                 last.saturating_sub(DEFAULT_REORG_DEPTH)
             }
         }
-        None => from_height.unwrap_or_else(|| tip.saturating_sub(DEFAULT_LOOKBACK_BLOCKS)),
+        None => from_height.unwrap_or_else(|| current_tip.saturating_sub(DEFAULT_LOOKBACK_BLOCKS)),
     };
 
-    let end_height = tip;
-
-    if start_height > end_height {
-        let result = apply_detected(store, &[], tip, confirmations)?;
+    if start_height > current_tip {
+        let result = apply_detected(store, &[], current_tip, confirmations)
+            .map_err(ScanError::database)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let _ = store.set_last_success_unix_time(now);
         return Ok(ScanPassSummary {
             blocks_scanned: 0,
             start_height,
-            end_height,
+            end_height: current_tip,
             payments_detected: result.payments_detected,
             invoices_paid: result.invoices_paid,
         });
     }
 
-    let range = BlockRange {
-        start: Some(BlockId {
-            height: start_height,
-            hash: vec![],
-        }),
-        end: Some(BlockId {
-            height: end_height,
-            hash: vec![],
-        }),
-        pool_types: vec![],
-    };
+    let mut chunks = plan_chunks(start_height, current_tip, CHUNK_BLOCKS);
+    let mut total_blocks_scanned: u64 = 0;
+    let mut total_payments_detected: usize = 0;
+    let mut total_invoices_paid: usize = 0;
+    let mut final_end = current_tip;
+    let mut chunk_idx = 0;
 
-    let mut stream = client
-        .get_block_range(tonic::Request::new(range))
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to request block range [{}..={}] from lightwalletd",
-                start_height, end_height
-            )
-        })?
-        .into_inner();
+    while chunk_idx < chunks.len() {
+        let (chunk_start, chunk_end) = chunks[chunk_idx];
+        final_end = chunk_end;
 
-    let mut blocks_scanned: u64 = 0;
-    let mut detected_notes = Vec::new();
-    let mut prior_metadata: Option<BlockMetadata> = None;
-    let mut current_block_hashes = Vec::new();
+        // Each chunk has its own 60 second timeout
+        let chunk_res = tokio::time::timeout(
+            CHUNK_TIMEOUT,
+            scan_single_chunk(
+                client,
+                store,
+                network,
+                scanning_keys,
+                nullifiers,
+                uivk,
+                confirmations,
+                chunk_start,
+                chunk_end,
+                current_tip,
+            ),
+        )
+        .await;
 
-    while let Some(block) = stream
-        .message()
-        .await
-        .with_context(|| "Error receiving compact block from stream")?
-    {
-        let height = block.height;
-        let hash_hex = hex_encode(&block.hash);
-        current_block_hashes.push((height, hash_hex));
+        match chunk_res {
+            Ok(Ok((scanned, payments, paid))) => {
+                total_blocks_scanned += scanned;
+                total_payments_detected += payments;
+                total_invoices_paid += paid;
+                chunk_idx += 1;
 
-        let (notes, metadata) = scan_compact_block(
-            network,
-            block,
-            scanning_keys,
-            nullifiers,
-            prior_metadata.as_ref(),
-            uivk,
-        )?;
-
-        detected_notes.extend(notes);
-        prior_metadata = Some(metadata);
-        blocks_scanned += 1;
+                // Re-read the tip between chunks
+                if let Ok(tip_resp) = client.get_lightd_info(tonic::Request::new(Empty {})).await {
+                    let new_tip = tip_resp.into_inner().block_height;
+                    if new_tip > current_tip {
+                        let old_tip = current_tip;
+                        current_tip = new_tip;
+                        let _ = store.set_chain_tip(current_tip);
+                        let extra_chunks = plan_chunks(old_tip + 1, current_tip, CHUNK_BLOCKS);
+                        chunks.extend(extra_chunks);
+                    }
+                }
+            }
+            Ok(Err(err)) => {
+                let _ = store.set_last_error_category(&err.kind.category());
+                return Err(err);
+            }
+            Err(_elapsed) => {
+                let err = ScanError::timeout();
+                let _ = store.set_last_error_category(&err.kind.category());
+                return Err(err);
+            }
+        }
     }
 
-    // Check for reorganization and rollback if block hashes differ
-    let _ = check_and_rollback_reorg(store, &current_block_hashes)?;
-
-    // Apply detected notes to database
-    let result = apply_detected(store, &detected_notes, tip, confirmations)?;
-
-    // Update scan cursor in invoice_meta only after full pass success
-    store.set_last_scanned_height(end_height)?;
-
     Ok(ScanPassSummary {
-        blocks_scanned,
+        blocks_scanned: total_blocks_scanned,
         start_height,
-        end_height,
-        payments_detected: result.payments_detected,
-        invoices_paid: result.invoices_paid,
+        end_height: final_end,
+        payments_detected: total_payments_detected,
+        invoices_paid: total_invoices_paid,
     })
 }
 
@@ -1245,5 +1450,89 @@ mod tests {
         // Invoice status must revert to Pending since remaining confirmed payment (50_000) < 100_000
         let fetched_after = store.get_by_address_index(inv.address_index).unwrap().unwrap();
         assert_eq!(fetched_after.status, InvoiceStatus::Pending);
+    }
+
+    #[test]
+    fn test_plan_chunks_start_greater_than_end() {
+        let chunks = plan_chunks(100, 50, 500);
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn test_plan_chunks_empty_range() {
+        let chunks = plan_chunks(100, 100, 0);
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn test_plan_chunks_exact_multiple() {
+        let chunks = plan_chunks(1, 1000, 500);
+        assert_eq!(chunks, vec![(1, 500), (501, 1000)]);
+
+        let chunks2 = plan_chunks(100, 599, 500);
+        assert_eq!(chunks2, vec![(100, 599)]);
+    }
+
+    #[test]
+    fn test_plan_chunks_remainder() {
+        let chunks = plan_chunks(1, 1200, 500);
+        assert_eq!(chunks, vec![(1, 500), (501, 1000), (1001, 1200)]);
+
+        let chunks2 = plan_chunks(10, 25, 10);
+        assert_eq!(chunks2, vec![(10, 19), (20, 25)]);
+    }
+
+    #[test]
+    fn test_plan_chunks_single_block() {
+        let chunks = plan_chunks(500, 500, 500);
+        assert_eq!(chunks, vec![(500, 500)]);
+    }
+
+    #[test]
+    fn test_default_error_output_contains_no_sensitive_data() {
+        let viewing_key_text = "uviewtest1z67w8y90abcdef1234567890abcdef1234567890abcdef";
+        let address_text = "utest1z67w8y90testaddress1234567890testaddress1234567890";
+        let txid_text = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+        let amount_text = "50000000";
+
+        let sensitive_source_err = anyhow!(
+            "internal failure scanning key {} address {} txid {} amount {}",
+            viewing_key_text,
+            address_text,
+            txid_text,
+            amount_text
+        );
+
+        let errs = vec![
+            ScanError::connect(anyhow!("connect error with {}", viewing_key_text)),
+            ScanError::timeout(),
+            ScanError::stream(anyhow!("stream broke on txid {}", txid_text)),
+            ScanError::scan_block(3120500, sensitive_source_err),
+            ScanError::database(anyhow!("db error on address {}", address_text)),
+            ScanError::other(anyhow!("other error with amount {}", amount_text)),
+        ];
+
+        for err in &errs {
+            let cat = err.kind.category();
+            let default_log = format!("scan pass failed ({cat}), retrying in 20 seconds");
+
+            assert!(!default_log.contains(viewing_key_text));
+            assert!(!default_log.contains(address_text));
+            assert!(!default_log.contains(txid_text));
+            assert!(!default_log.contains(amount_text));
+
+            match &err.kind {
+                ScanErrorKind::Connect => assert_eq!(cat, "connect"),
+                ScanErrorKind::Timeout => assert_eq!(cat, "timeout"),
+                ScanErrorKind::Stream => assert_eq!(cat, "stream"),
+                ScanErrorKind::ScanBlock { height } => {
+                    assert_eq!(*height, 3120500);
+                    assert!(cat.contains("3120500"));
+                    assert!(cat.starts_with("scan_block"));
+                }
+                ScanErrorKind::Database => assert_eq!(cat, "database"),
+                ScanErrorKind::Other => assert_eq!(cat, "other"),
+            }
+        }
     }
 }

@@ -10,7 +10,7 @@
 use std::borrow::Cow;
 use crate::web::amount::format_zec_display;
 use crate::web::icons;
-use crate::invoices::Invoice;
+use crate::invoices::{Invoice, ScannerHealth};
 
 /// Escapes HTML special characters: `&`, `<`, `>`, `"`, and `'`.
 pub fn esc(s: &str) -> String {
@@ -495,12 +495,72 @@ pub fn render_merchant_dashboard(
     error_msg: Option<&str>,
     repo_url: Option<&str>,
     filter: Option<&str>,
+    scanner_health: Option<&ScannerHealth>,
 ) -> String {
     let error_html = if let Some(err) = error_msg {
         format!(r#"<div class="form-error" role="alert">{}</div>"#, esc(err))
     } else {
         String::new()
     };
+
+    let (last_scanned_str, tip_str, behind_str, last_success_str, last_err_str) =
+        if let Some(h) = scanner_health {
+            let ls = h
+                .last_scanned_block
+                .map(|b| esc(&b.to_string()))
+                .unwrap_or_else(|| "None".to_string());
+            let tip = h
+                .chain_tip
+                .map(|t| esc(&t.to_string()))
+                .unwrap_or_else(|| "None".to_string());
+            let behind = esc(&h.blocks_behind.to_string());
+            let ls_time = h
+                .last_success_unix_time
+                .map(|t| esc(&format!("Unix {t}")))
+                .unwrap_or_else(|| "Never".to_string());
+            let err = h
+                .last_error_category
+                .as_deref()
+                .map(esc)
+                .unwrap_or_else(|| "None".to_string());
+            (ls, tip, behind, ls_time, err)
+        } else {
+            (
+                "None".to_string(),
+                "None".to_string(),
+                "0".to_string(),
+                "Never".to_string(),
+                "None".to_string(),
+            )
+        };
+
+    let scanner_panel_html = format!(
+        r#"<div class="checkout-card mb-4" id="scanner-health-panel">
+        <h3>Scanner</h3>
+        <div class="scanner-grid">
+            <div class="scanner-stat">
+                <div class="scanner-stat-label">Last Scanned Block</div>
+                <div class="scanner-stat-value" id="scanner-last-scanned">{last_scanned_str}</div>
+            </div>
+            <div class="scanner-stat">
+                <div class="scanner-stat-label">Chain Tip</div>
+                <div class="scanner-stat-value" id="scanner-chain-tip">{tip_str}</div>
+            </div>
+            <div class="scanner-stat">
+                <div class="scanner-stat-label">Blocks Behind</div>
+                <div class="scanner-stat-value" id="scanner-blocks-behind">{behind_str}</div>
+            </div>
+            <div class="scanner-stat">
+                <div class="scanner-stat-label">Last Successful Scan</div>
+                <div class="scanner-stat-value" id="scanner-last-success">{last_success_str}</div>
+            </div>
+            <div class="scanner-stat">
+                <div class="scanner-stat-label">Last Error Category</div>
+                <div class="scanner-stat-value" id="scanner-last-error">{last_err_str}</div>
+            </div>
+        </div>
+    </div>"#
+    );
 
     let csrf_token_esc = esc(csrf_token);
     let total_invoices = invoices.len();
@@ -586,6 +646,8 @@ pub fn render_merchant_dashboard(
 
     {error_html}
 
+    {scanner_panel_html}
+
     <div class="totals-grid">
         <div class="total-card">
             <div class="total-label">Total Invoices</div>
@@ -649,6 +711,7 @@ pub fn render_merchant_dashboard(
         csrf_token = csrf_token_esc,
         total_volume = total_volume,
         total_paid_volume = total_paid_volume,
+        scanner_panel_html = scanner_panel_html,
     );
 
     layout("Merchant Dashboard", &content, true, repo_url, Some(csrf_token), None, true)

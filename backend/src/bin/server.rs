@@ -61,6 +61,10 @@ struct Cli {
     /// Prompts for a password, outputs the Argon2id hash, and exits
     #[arg(long)]
     hash_password: bool,
+
+    /// Enable detailed error chains logging for local debugging (forbidden on hosted demo)
+    #[arg(long, env = "VEILGATE_DEBUG_ERRORS", default_value_t = false)]
+    debug_errors: bool,
 }
 
 fn resolve_file_path(relative: &str) -> PathBuf {
@@ -79,7 +83,6 @@ fn resolve_file_path(relative: &str) -> PathBuf {
     }
 }
 
-const PASS_TIMEOUT: Duration = Duration::from_secs(60);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(5);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 const SCAN_INTERVAL: Duration = Duration::from_secs(20);
@@ -87,6 +90,10 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(20);
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Cli::parse();
+
+    if args.debug_errors {
+        eprintln!("WARNING: --debug-errors is enabled. Full error chains will be logged. Do NOT use this flag on the hosted demo or production environments.");
+    }
 
     // Check if --hash-password mode was requested
     if args.hash_password {
@@ -167,6 +174,7 @@ async fn main() -> Result<()> {
         }
     });
 
+    let debug_errors = args.debug_errors;
     tokio::spawn(async move {
         let scanning_keys = match build_scanning_keys(&scanner_uivk) {
             Ok(k) => k,
@@ -201,11 +209,20 @@ async fn main() -> Result<()> {
                     Ok(c) => {
                         client = Some(c);
                     }
-                    Err(_) => {
-                        eprintln!(
-                            "scan pass failed, retrying in {} seconds",
-                            backoff.as_secs()
-                        );
+                    Err(e) => {
+                        let cat = "connect";
+                        let _ = scanner_store.set_last_error_category(cat);
+                        if debug_errors {
+                            eprintln!(
+                                "scan pass failed ({cat}), retrying in {} seconds: {e:?}",
+                                backoff.as_secs()
+                            );
+                        } else {
+                            eprintln!(
+                                "scan pass failed ({cat}), retrying in {} seconds",
+                                backoff.as_secs()
+                            );
+                        }
                         sleep(backoff).await;
                         backoff = std::cmp::min(backoff.saturating_mul(2), MAX_BACKOFF);
                         continue;
@@ -214,41 +231,45 @@ async fn main() -> Result<()> {
             }
 
             let cl = client.as_mut().expect("client verified Some above");
-            let pass_res = tokio::time::timeout(
-                PASS_TIMEOUT,
-                run_scan_pass(
-                    cl,
-                    &scanner_store,
-                    &network,
-                    &scanning_keys,
-                    &nullifiers,
-                    &scanner_uivk,
-                    scanner_confs,
-                    None,
-                ),
+            let pass_res = run_scan_pass(
+                cl,
+                &scanner_store,
+                &network,
+                &scanning_keys,
+                &nullifiers,
+                &scanner_uivk,
+                scanner_confs,
+                None,
             )
             .await;
 
             match pass_res {
-                Ok(Ok(_summary)) => {
+                Ok(_summary) => {
                     backoff = INITIAL_BACKOFF;
                     sleep(SCAN_INTERVAL).await;
                 }
-                Ok(Err(_)) => {
+                Err(err) => {
                     client = None;
-                    eprintln!(
-                        "scan pass failed, retrying in {} seconds",
-                        backoff.as_secs()
-                    );
-                    sleep(backoff).await;
-                    backoff = std::cmp::min(backoff.saturating_mul(2), MAX_BACKOFF);
-                }
-                Err(_) => {
-                    client = None;
-                    eprintln!(
-                        "scan pass failed, retrying in {} seconds",
-                        backoff.as_secs()
-                    );
+                    let cat = err.kind.category();
+                    let _ = scanner_store.set_last_error_category(&cat);
+                    if debug_errors {
+                        if let Some(src) = &err.source {
+                            eprintln!(
+                                "scan pass failed ({cat}), retrying in {} seconds: {src:?}",
+                                backoff.as_secs()
+                            );
+                        } else {
+                            eprintln!(
+                                "scan pass failed ({cat}), retrying in {} seconds",
+                                backoff.as_secs()
+                            );
+                        }
+                    } else {
+                        eprintln!(
+                            "scan pass failed ({cat}), retrying in {} seconds",
+                            backoff.as_secs()
+                        );
+                    }
                     sleep(backoff).await;
                     backoff = std::cmp::min(backoff.saturating_mul(2), MAX_BACKOFF);
                 }
@@ -280,7 +301,16 @@ async fn main() -> Result<()> {
         }
     };
 
-    println!("VeilGate server listening on http://{}", args.listen);
+    let cursor_str = match store.get_last_scanned_height()? {
+        Some(h) => h.to_string(),
+        None => "none".to_string(),
+    };
+    let behind = match (store.get_last_scanned_height()?, store.get_chain_tip()?) {
+        (Some(c), Some(t)) => t.saturating_sub(c),
+        _ => 0,
+    };
+    println!("Scan cursor: {}, tip behind: {}", cursor_str, behind);
+
     axum::serve(
         listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),

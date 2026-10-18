@@ -559,12 +559,14 @@ pub async fn merchant_dashboard_get(
         _ => all_invoices.into_iter().filter(|i| !i.is_demo).collect(),
     };
 
+    let scanner_health = state.store.get_scanner_health().ok();
     let html = render_merchant_dashboard(
         &filtered_invoices,
         &session.csrf_token,
         None,
         state.repo_url.as_deref(),
         Some(validated_filter),
+        scanner_health.as_ref(),
     );
     Html(html).into_response()
 }
@@ -593,6 +595,8 @@ pub async fn merchant_create_invoice_post(
             .into_response();
     }
 
+    let scanner_health = state.store.get_scanner_health().ok();
+
     let amount_zatoshi = match parse_zec_amount(&form.amount) {
         Ok(z) => z,
         Err(_) => {
@@ -603,6 +607,7 @@ pub async fn merchant_create_invoice_post(
                 Some("Could not create the invoice. Please try again."),
                 state.repo_url.as_deref(),
                 Some("all"),
+                scanner_health.as_ref(),
             );
             return (StatusCode::BAD_REQUEST, Html(html)).into_response();
         }
@@ -630,6 +635,7 @@ pub async fn merchant_create_invoice_post(
                 Some("Could not create the invoice. Please try again."),
                 state.repo_url.as_deref(),
                 Some("all"),
+                scanner_health.as_ref(),
             );
             (StatusCode::INTERNAL_SERVER_ERROR, Html(html)).into_response()
         }

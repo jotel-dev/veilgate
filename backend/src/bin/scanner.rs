@@ -46,6 +46,10 @@ struct Cli {
     /// Path to VeilGate SQLite database
     #[arg(long, default_value = ".veilgate/veilgate.db")]
     db_path: String,
+
+    /// Enable detailed error chains logging for local debugging (forbidden on hosted demo)
+    #[arg(long, default_value_t = false)]
+    debug_errors: bool,
 }
 
 fn resolve_file_path(relative: &str) -> PathBuf {
@@ -64,13 +68,17 @@ fn resolve_file_path(relative: &str) -> PathBuf {
     }
 }
 
-const PASS_TIMEOUT: Duration = Duration::from_secs(60);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(5);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Cli::parse();
+
+    if args.debug_errors {
+        eprintln!("WARNING: --debug-errors is enabled. Full error chains will be logged. Do NOT use this flag on the hosted demo or production environments.");
+    }
+
     let network = Network::TestNetwork;
 
     // Load merchant incoming viewing key from disk (never log or leak the key)
@@ -116,13 +124,27 @@ async fn main() -> Result<()> {
                     client = Some(c);
                 }
                 Err(e) => {
-                    if args.once {
-                        return Err(e).context("Failed to connect to lightwalletd server");
+                    let cat = "connect";
+                    let _ = store.set_last_error_category(cat);
+                    if args.debug_errors {
+                        eprintln!(
+                            "scan pass failed ({cat}), retrying in {} seconds: {e:?}",
+                            backoff.as_secs()
+                        );
+                    } else {
+                        eprintln!(
+                            "scan pass failed ({cat}), retrying in {} seconds",
+                            backoff.as_secs()
+                        );
                     }
-                    eprintln!(
-                        "scan pass failed, retrying in {} seconds",
-                        backoff.as_secs()
-                    );
+                    if args.once {
+                        if args.debug_errors {
+                            return Err(e).context("Failed to connect to lightwalletd server");
+                        } else {
+                            eprintln!("scan pass failed ({cat})");
+                            std::process::exit(1);
+                        }
+                    }
                     sleep(backoff).await;
                     backoff = std::cmp::min(backoff.saturating_mul(2), MAX_BACKOFF);
                     continue;
@@ -132,23 +154,20 @@ async fn main() -> Result<()> {
 
         let cl = client.as_mut().expect("client verified Some above");
 
-        let pass_res = tokio::time::timeout(
-            PASS_TIMEOUT,
-            run_scan_pass(
-                cl,
-                &store,
-                &network,
-                &scanning_keys,
-                &nullifiers,
-                &uivk,
-                args.confirmations,
-                args.from_height,
-            ),
+        let pass_res = run_scan_pass(
+            cl,
+            &store,
+            &network,
+            &scanning_keys,
+            &nullifiers,
+            &uivk,
+            args.confirmations,
+            args.from_height,
         )
         .await;
 
         match pass_res {
-            Ok(Ok(summary)) => {
+            Ok(summary) => {
                 backoff = INITIAL_BACKOFF;
                 println!(
                     "Scanned {} blocks ({}..={}), {} payments detected, {} invoices paid.",
@@ -163,30 +182,40 @@ async fn main() -> Result<()> {
                 }
                 sleep(Duration::from_secs(args.interval_seconds)).await;
             }
-            Ok(Err(e)) => {
-                if args.once {
-                    return Err(e);
-                }
+            Err(err) => {
                 client = None;
-                eprintln!(
-                    "scan pass failed, retrying in {} seconds",
-                    backoff.as_secs()
-                );
-                sleep(backoff).await;
-                backoff = std::cmp::min(backoff.saturating_mul(2), MAX_BACKOFF);
-            }
-            Err(_elapsed) => {
-                if args.once {
-                    return Err(anyhow!(
-                        "Scan pass timed out after {} seconds",
-                        PASS_TIMEOUT.as_secs()
-                    ));
+                let cat = err.kind.category();
+                let _ = store.set_last_error_category(&cat);
+                if args.debug_errors {
+                    if let Some(src) = &err.source {
+                        eprintln!(
+                            "scan pass failed ({cat}), retrying in {} seconds: {src:?}",
+                            backoff.as_secs()
+                        );
+                    } else {
+                        eprintln!(
+                            "scan pass failed ({cat}), retrying in {} seconds",
+                            backoff.as_secs()
+                        );
+                    }
+                } else {
+                    eprintln!(
+                        "scan pass failed ({cat}), retrying in {} seconds",
+                        backoff.as_secs()
+                    );
                 }
-                client = None;
-                eprintln!(
-                    "scan pass failed, retrying in {} seconds",
-                    backoff.as_secs()
-                );
+                if args.once {
+                    if args.debug_errors {
+                        if let Some(src) = err.source {
+                            return Err(src).context(format!("scan pass failed ({cat})"));
+                        } else {
+                            return Err(anyhow!("scan pass failed ({cat})"));
+                        }
+                    } else {
+                        eprintln!("scan pass failed ({cat})");
+                        std::process::exit(1);
+                    }
+                }
                 sleep(backoff).await;
                 backoff = std::cmp::min(backoff.saturating_mul(2), MAX_BACKOFF);
             }

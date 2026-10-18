@@ -702,6 +702,96 @@ pub fn set_chain_tip(store: &Store, tip: u64) -> Result<()> {
     Ok(())
 }
 
+/// Retrieves the last successful scan timestamp (in Unix epoch seconds) from invoice_meta.
+pub fn get_last_success_unix_time(store: &Store) -> Result<Option<u64>> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
+    let val: Option<i64> = conn
+        .query_row(
+            "SELECT value FROM invoice_meta WHERE key = 'last_success_unix_time'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(val.map(|v| v as u64))
+}
+
+/// Stores the last successful scan timestamp (in Unix epoch seconds) in invoice_meta.
+pub fn set_last_success_unix_time(store: &Store, timestamp: u64) -> Result<()> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
+    conn.execute(
+        "INSERT INTO invoice_meta (key, value) VALUES ('last_success_unix_time', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [timestamp as i64],
+    )?;
+    Ok(())
+}
+
+/// Retrieves the category of the last scan error from invoice_meta.
+pub fn get_last_error_category(store: &Store) -> Result<Option<String>> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
+    let val: Option<String> = conn
+        .query_row(
+            "SELECT CAST(value AS TEXT) FROM invoice_meta WHERE key = 'last_error_category'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(val)
+}
+
+/// Stores the category of the last scan error in invoice_meta.
+pub fn set_last_error_category(store: &Store, category: &str) -> Result<()> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
+    conn.execute(
+        "INSERT INTO invoice_meta (key, value) VALUES ('last_error_category', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [category],
+    )?;
+    Ok(())
+}
+
+/// Health and status statistics for the payment scanner.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScannerHealth {
+    pub last_scanned_block: Option<u64>,
+    pub chain_tip: Option<u64>,
+    pub blocks_behind: u64,
+    pub last_success_unix_time: Option<u64>,
+    pub last_error_category: Option<String>,
+}
+
+/// Computes current scanner health statistics from invoice_meta.
+pub fn get_scanner_health(store: &Store) -> Result<ScannerHealth> {
+    let last_scanned = get_last_scanned_height(store)?;
+    let tip = get_chain_tip(store)?;
+    let blocks_behind = match (last_scanned, tip) {
+        (Some(ls), Some(t)) => t.saturating_sub(ls),
+        _ => 0,
+    };
+    let last_success = get_last_success_unix_time(store)?;
+    let last_error = get_last_error_category(store)?;
+
+    Ok(ScannerHealth {
+        last_scanned_block: last_scanned,
+        chain_tip: tip,
+        blocks_behind,
+        last_success_unix_time: last_success,
+        last_error_category: last_error,
+    })
+}
+
 /// Deletes all payments at or above the given block height (used during chain reorganization).
 /// Automatically reverts any invoices marked paid whose remaining confirmed payments fall below amount_zatoshi.
 pub fn delete_payments_from_height(store: &Store, height: u64) -> Result<usize> {
@@ -894,6 +984,31 @@ impl Store {
     /// Sets the current chain tip height.
     pub fn set_chain_tip(&self, tip: u64) -> Result<()> {
         set_chain_tip(self, tip)
+    }
+
+    /// Gets the last successful scan timestamp.
+    pub fn get_last_success_unix_time(&self) -> Result<Option<u64>> {
+        get_last_success_unix_time(self)
+    }
+
+    /// Sets the last successful scan timestamp.
+    pub fn set_last_success_unix_time(&self, timestamp: u64) -> Result<()> {
+        set_last_success_unix_time(self, timestamp)
+    }
+
+    /// Gets the category of the last scan error.
+    pub fn get_last_error_category(&self) -> Result<Option<String>> {
+        get_last_error_category(self)
+    }
+
+    /// Sets the category of the last scan error.
+    pub fn set_last_error_category(&self, category: &str) -> Result<()> {
+        set_last_error_category(self, category)
+    }
+
+    /// Gets the full scanner health report.
+    pub fn get_scanner_health(&self) -> Result<ScannerHealth> {
+        get_scanner_health(self)
     }
 }
 
