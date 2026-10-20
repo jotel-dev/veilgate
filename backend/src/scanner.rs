@@ -52,6 +52,32 @@ pub fn plan_chunks(start: u64, end: u64, size: u64) -> Vec<(u64, u64)> {
     chunks
 }
 
+/// Determines the starting scan block height.
+///
+/// If `last_scanned` is `None` (e.g. a new database), begins scanning at `current_tip - 100`
+/// (`DEFAULT_LOOKBACK_BLOCKS`), or `from_height` if explicitly specified.
+/// If `last_scanned` exists, resumes scanning with reorg lookback (`DEFAULT_REORG_DEPTH`).
+pub fn calculate_scan_start_height(
+    last_scanned: Option<u64>,
+    current_tip: u64,
+    from_height: Option<u64>,
+) -> u64 {
+    match last_scanned {
+        Some(last) => {
+            if let Some(explicit) = from_height {
+                if last < explicit {
+                    explicit
+                } else {
+                    last.saturating_sub(DEFAULT_REORG_DEPTH)
+                }
+            } else {
+                last.saturating_sub(DEFAULT_REORG_DEPTH)
+            }
+        }
+        None => from_height.unwrap_or_else(|| current_tip.saturating_sub(DEFAULT_LOOKBACK_BLOCKS)),
+    }
+}
+
 /// Categorization of scanner failures to prevent leakage of sensitive data in logs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScanErrorKind {
@@ -736,21 +762,7 @@ pub async fn run_scan_pass(
     store.set_chain_tip(current_tip).map_err(ScanError::database)?;
 
     let last_scanned = store.get_last_scanned_height().map_err(ScanError::database)?;
-
-    let start_height = match last_scanned {
-        Some(last) => {
-            if let Some(explicit) = from_height {
-                if last < explicit {
-                    explicit
-                } else {
-                    last.saturating_sub(DEFAULT_REORG_DEPTH)
-                }
-            } else {
-                last.saturating_sub(DEFAULT_REORG_DEPTH)
-            }
-        }
-        None => from_height.unwrap_or_else(|| current_tip.saturating_sub(DEFAULT_LOOKBACK_BLOCKS)),
-    };
+    let start_height = calculate_scan_start_height(last_scanned, current_tip, from_height);
 
     if start_height > current_tip {
         let result = apply_detected(store, &[], current_tip, confirmations)
@@ -1534,5 +1546,26 @@ mod tests {
                 ScanErrorKind::Other => assert_eq!(cat, "other"),
             }
         }
+    }
+
+    #[test]
+    fn test_calculate_scan_start_height_new_database_starts_at_tip_minus_100() {
+        let current_tip = 3_000_000;
+
+        // 1. New database (last_scanned = None) starts at tip - 100
+        let start_new = calculate_scan_start_height(None, current_tip, None);
+        assert_eq!(
+            start_new,
+            2_999_900,
+            "New database must start at tip minus 100"
+        );
+
+        // 2. Explicit from_height takes precedence for new database
+        let start_explicit = calculate_scan_start_height(None, current_tip, Some(2_500_000));
+        assert_eq!(start_explicit, 2_500_000);
+
+        // 3. Existing database resumes from last_scanned minus reorg depth
+        let start_resume = calculate_scan_start_height(Some(2_999_950), current_tip, None);
+        assert_eq!(start_resume, 2_999_950 - DEFAULT_REORG_DEPTH);
     }
 }

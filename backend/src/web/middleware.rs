@@ -66,11 +66,12 @@ pub async fn security_headers_middleware(
     headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     headers.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
 
-    // Pages handling invoice data, authentication, or demo interaction must not be indexed or cached
+    // Pages handling invoice data, authentication, health checks, or demo interaction must not be indexed or cached
     let is_sensitive = path.starts_with("/pay")
         || path.starts_with("/api/invoice")
         || path.starts_with("/merchant")
-        || path.starts_with("/demo");
+        || path.starts_with("/demo")
+        || path == "/healthz";
 
     if is_sensitive {
         headers.insert("x-robots-tag", HeaderValue::from_static("noindex"));

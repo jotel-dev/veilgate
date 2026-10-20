@@ -13,9 +13,10 @@ use tokio::time::sleep;
 use tonic::transport::{ClientTlsConfig, Endpoint};
 use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
 use zcash_client_backend::scanning::Nullifiers;
+use zcash_keys::keys::UnifiedIncomingViewingKey;
 use zcash_protocol::consensus::Network;
 
-use veilgate_backend::addresses::load_viewing_key;
+use veilgate_backend::addresses::resolve_viewing_key;
 use veilgate_backend::invoices::open_store;
 use veilgate_backend::scanner::{build_scanning_keys, run_scan_pass, DEFAULT_CONFIRMATIONS};
 use veilgate_backend::web::auth::SessionManager;
@@ -27,12 +28,16 @@ use veilgate_backend::web::{build_app, hash_password, AppState};
 #[command(about = "VeilGate Payment Server: shielded checkout, web dashboard, and in-process scanner")]
 struct Cli {
     /// Socket address to listen on
-    #[arg(long, env = "VEILGATE_LISTEN", default_value = "127.0.0.1:8080")]
-    listen: SocketAddr,
+    #[arg(long, env = "VEILGATE_LISTEN")]
+    listen: Option<SocketAddr>,
 
     /// lightwalletd server gRPC endpoint URL over TLS
-    #[arg(long, env = "VEILGATE_URL", default_value = "https://testnet.zec.rocks:443")]
-    url: String,
+    #[arg(long, env = "VEILGATE_LIGHTWALLETD_URL")]
+    lightwalletd_url: Option<String>,
+
+    /// Legacy lightwalletd server gRPC endpoint URL over TLS
+    #[arg(long, env = "VEILGATE_URL")]
+    url: Option<String>,
 
     /// Minimum confirmations required to mark an invoice as Paid
     #[arg(long, env = "VEILGATE_CONFIRMATIONS", default_value_t = DEFAULT_CONFIRMATIONS)]
@@ -51,7 +56,7 @@ struct Cli {
     repo_url: Option<String>,
 
     /// Enable demo mode (/demo endpoint for testnet invoices)
-    #[arg(long, env = "VEILGATE_DEMO")]
+    #[arg(long)]
     demo: bool,
 
     /// Header to trust for client IP when behind a reverse proxy (e.g. x-forwarded-for, fly-client-ip)
@@ -69,7 +74,7 @@ struct Cli {
 
 fn resolve_file_path(relative: &str) -> PathBuf {
     let direct = Path::new(relative);
-    if direct.exists() {
+    if direct.is_absolute() || direct.exists() {
         return direct.to_path_buf();
     }
     let parent = Path::new("..").join(relative);
@@ -81,6 +86,27 @@ fn resolve_file_path(relative: &str) -> PathBuf {
     } else {
         direct.to_path_buf()
     }
+}
+
+fn resolve_listen_address(cli_listen: Option<SocketAddr>) -> Result<SocketAddr> {
+    let listen_passed_on_cli = std::env::args().any(|a| a == "--listen" || a.starts_with("--listen="));
+    let port_env = std::env::var("PORT").ok();
+    let listen_env = std::env::var("VEILGATE_LISTEN").ok();
+    veilgate_backend::web::handlers::resolve_listen_address_from_config(
+        cli_listen,
+        port_env.as_deref(),
+        listen_env.as_deref(),
+        listen_passed_on_cli,
+    )
+}
+
+fn load_server_viewing_key(
+    key_path_arg: &str,
+    network: &Network,
+) -> Result<UnifiedIncomingViewingKey> {
+    let env_key = std::env::var("VEILGATE_VIEWING_KEY").ok();
+    let key_path = resolve_file_path(key_path_arg);
+    resolve_viewing_key(env_key.as_deref(), &key_path, network)
 }
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(5);
@@ -120,15 +146,7 @@ async fn main() -> Result<()> {
     let network = Network::TestNetwork;
 
     // Load merchant incoming viewing key (never log or leak the key)
-    let key_path = resolve_file_path(&args.key_path);
-    if !key_path.exists() {
-        return Err(anyhow!(
-            "Merchant viewing key file not found at: {}. Please ensure the viewing key file exists.",
-            key_path.display()
-        ));
-    }
-    let uivk = load_viewing_key(&key_path, &network)
-        .with_context(|| format!("Failed to load viewing key from {}", key_path.display()))?;
+    let uivk = load_server_viewing_key(&args.key_path, &network)?;
 
     // Open merchant invoice store
     let db_path = resolve_file_path(&args.db_path);
@@ -142,15 +160,27 @@ async fn main() -> Result<()> {
         eprintln!("Notice: VEILGATE_PASSWORD_HASH not set. Merchant dashboard login will be disabled until set.");
     }
 
+    let listen_addr = resolve_listen_address(args.listen)?;
+
+    let demo_enabled = args.demo
+        || std::env::var("VEILGATE_DEMO")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+    let scanner_url = args
+        .lightwalletd_url
+        .or(args.url)
+        .unwrap_or_else(|| "https://testnet.zec.rocks:443".to_string());
+
     // Build application state
-    let is_localhost = args.listen.ip().is_loopback();
+    let is_localhost = listen_addr.ip().is_loopback();
     let app_state = AppState {
         store: Arc::clone(&store),
         uivk: Arc::new(uivk.clone()),
         network,
         confirmations: args.confirmations,
         repo_url: args.repo_url.clone(),
-        demo_enabled: args.demo,
+        demo_enabled,
         password_hash,
         session_manager: Arc::new(SessionManager::new()),
         rate_limiter: Arc::new(RateLimiter::new()),
@@ -161,7 +191,7 @@ async fn main() -> Result<()> {
     // Spawn background payment scanner task
     let scanner_store = Arc::clone(&store);
     let scanner_uivk = uivk.clone();
-    let scanner_url = args.url.clone();
+    let scanner_url_clone = scanner_url.clone();
     let scanner_confs = args.confirmations;
 
     // Spawn background task to delete unpaid demo invoices expired for more than 24 hours
@@ -186,7 +216,7 @@ async fn main() -> Result<()> {
         let nullifiers = Nullifiers::empty();
 
         let tls = ClientTlsConfig::new().with_webpki_roots();
-        let endpoint = match Endpoint::from_shared(scanner_url.clone()) {
+        let endpoint = match Endpoint::from_shared(scanner_url_clone) {
             Ok(ep) => match ep.tls_config(tls) {
                 Ok(configured) => configured,
                 Err(e) => {
@@ -278,21 +308,21 @@ async fn main() -> Result<()> {
     });
 
     let router = build_app(app_state);
-    let listener = match tokio::net::TcpListener::bind(args.listen).await {
+    let listener = match tokio::net::TcpListener::bind(listen_addr).await {
         Ok(l) => l,
         Err(orig_err) => {
-            let socket = if args.listen.is_ipv6() {
+            let socket = if listen_addr.is_ipv6() {
                 tokio::net::TcpSocket::new_v6()?
             } else {
                 tokio::net::TcpSocket::new_v4()?
             };
             let _ = socket.set_reuseaddr(true);
-            match socket.bind(args.listen) {
+            match socket.bind(listen_addr) {
                 Ok(_) => socket.listen(1024)?,
                 Err(e) => {
                     return Err(anyhow!(
                         "Failed to bind to {}: {} (socket error: {})",
-                        args.listen,
+                        listen_addr,
                         orig_err,
                         e
                     ));

@@ -111,16 +111,26 @@ pub fn resolve_client_identity(
 ) -> String {
     if let Some(trusted_name) = trusted_proxy_header {
         let name_lower = trusted_name.to_ascii_lowercase();
-        if let Some(val) = headers.get(&name_lower).and_then(|h| h.to_str().ok()) {
+        let all_headers: Vec<&str> = headers
+            .get_all(&name_lower)
+            .iter()
+            .filter_map(|h| h.to_str().ok())
+            .collect();
+
+        if !all_headers.is_empty() {
             if name_lower == "x-forwarded-for" {
-                if let Some(last) = val.split(',').next_back() {
-                    let trimmed = last.trim();
-                    if !trimmed.is_empty() {
-                        return trimmed.to_string();
+                // Reverse proxies append the real client IP at the end of the chain.
+                // We scan all headers in reverse order and extract the last comma-separated entry.
+                for val in all_headers.into_iter().rev() {
+                    if let Some(last) = val.split(',').next_back() {
+                        let trimmed = last.trim();
+                        if !trimmed.is_empty() {
+                            return trimmed.to_string();
+                        }
                     }
                 }
-            } else {
-                let trimmed = val.split(',').next_back().unwrap_or(val).trim();
+            } else if let Some(last_val) = all_headers.last() {
+                let trimmed = last_val.split(',').next_back().unwrap_or(last_val).trim();
                 if !trimmed.is_empty() {
                     return trimmed.to_string();
                 }
@@ -897,4 +907,85 @@ pub async fn demo_post(
             (StatusCode::INTERNAL_SERVER_ERROR, Html(html)).into_response()
         }
     }
+}
+
+/// `GET /healthz`
+///
+/// Health check endpoint for container orchestrators and PaaS (Render).
+/// Returns 200 OK with body "ok" only, containing no scanner data.
+/// Rate-limited per client identity and served with Cache-Control: no-store.
+pub async fn healthz_handler(
+    State(state): State<AppState>,
+    ClientIdentity(client_id): ClientIdentity,
+) -> Response {
+    let key = state.rate_limiter.client_key("healthz", &client_id);
+    if !state
+        .rate_limiter
+        .check_and_record(&key, 60, Duration::from_secs(60))
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                (axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                (axum::http::header::CACHE_CONTROL, "no-store"),
+            ],
+            "Too many requests",
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        "ok",
+    )
+        .into_response()
+}
+
+/// Resolves the socket address to listen on.
+///
+/// Precedence:
+/// 1. `--listen` CLI argument (if explicitly passed on the command line).
+/// 2. `PORT` environment variable (`0.0.0.0:$PORT`) when `--listen` is not given.
+/// 3. `cli_listen` / `VEILGATE_LISTEN` value if provided.
+/// 4. Default: `127.0.0.1:8080`.
+pub fn resolve_listen_address_from_config(
+    cli_listen: Option<SocketAddr>,
+    port_env: Option<&str>,
+    listen_env: Option<&str>,
+    cli_flag_given: bool,
+) -> anyhow::Result<SocketAddr> {
+    if cli_flag_given {
+        if let Some(addr) = cli_listen {
+            return Ok(addr);
+        }
+    }
+
+    if let Some(port_str) = port_env {
+        let trimmed = port_str.trim();
+        if !trimmed.is_empty() {
+            let port: u16 = trimmed
+                .parse()
+                .map_err(|e| anyhow::anyhow!("Invalid PORT environment variable: {e}"))?;
+            return Ok(SocketAddr::from(([0, 0, 0, 0], port)));
+        }
+    }
+
+    if let Some(addr) = cli_listen {
+        return Ok(addr);
+    }
+
+    if let Some(listen_str) = listen_env {
+        let trimmed = listen_str.trim();
+        if !trimmed.is_empty() {
+            return trimmed
+                .parse()
+                .map_err(|e| anyhow::anyhow!("Invalid VEILGATE_LISTEN environment variable: {e}"));
+        }
+    }
+
+    Ok(SocketAddr::from(([127, 0, 0, 1], 8080)))
 }

@@ -1810,4 +1810,192 @@ async fn test_dashboard_columns_and_payment_states() {
     assert!(body.contains("Awaiting"));
 }
 
+// =========================================================================
+// PaaS / Render Container Deployment & Health Endpoint Tests
+// =========================================================================
+
+#[tokio::test]
+async fn test_healthz_endpoint_status_body_and_headers() {
+    let (app, _store, _pid, _pw) = setup_test_app(false);
+
+    let req = Request::builder()
+        .uri("/healthz")
+        .body(Body::empty())
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Body must be "ok" only
+    let body = response_body_string(res).await;
+    assert_eq!(body, "ok");
+
+    // Must not expose any scanner, block, or transaction details
+    assert!(!body.contains("scanner"));
+    assert!(!body.contains("tip"));
+    assert!(!body.contains("height"));
+    assert!(!body.contains("block"));
+    assert!(!body.contains("behind"));
+}
+
+#[tokio::test]
+async fn test_healthz_rate_limiting_and_no_store() {
+    let (app, _store, _pid, _pw) = setup_test_app(false);
+
+    // Initial 60 requests within window succeed
+    for _ in 0..60 {
+        let req = Request::builder()
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get("cache-control").unwrap(),
+            "no-store"
+        );
+    }
+
+    // 61st request from same client exceeds limit
+    let req_blocked = Request::builder()
+        .uri("/healthz")
+        .body(Body::empty())
+        .unwrap();
+    let res_blocked = app.oneshot(req_blocked).await.unwrap();
+    assert_eq!(res_blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        res_blocked.headers().get("cache-control").unwrap(),
+        "no-store"
+    );
+}
+
+#[tokio::test]
+async fn test_demo_page_notice_for_ephemeral_disk() {
+    let (app, _store, _pid, _pw) = setup_test_app(true);
+
+    let req = Request::builder().uri("/demo").body(Body::empty()).unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let body = response_body_string(res).await;
+    assert!(
+        body.contains("This demo instance may reset. Invoices are not guaranteed to persist."),
+        "Demo page must contain ephemeral instance reset notice"
+    );
+}
+
+#[test]
+fn test_proxy_multi_header_and_comma_separated_last_entry() {
+    let mut headers = HeaderMap::new();
+    // Simulate reverse proxy appending its header as an additional header line
+    headers.append(
+        "x-forwarded-for",
+        "1.1.1.1, 2.2.2.2".parse().unwrap(),
+    );
+    headers.append(
+        "x-forwarded-for",
+        "3.3.3.3, 4.4.4.4".parse().unwrap(),
+    );
+
+    let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    let conn = ConnectInfo(peer);
+
+    let client_id = resolve_client_identity(&headers, Some(&conn), Some("x-forwarded-for"));
+    assert_eq!(client_id, "4.4.4.4", "Must use the LAST entry of x-forwarded-for");
+}
+
+#[tokio::test]
+async fn test_dashboard_total_paid_volume_shows_actually_received() {
+    let (app, store, session_mgr, _lim, _pid, _pw) =
+        setup_test_app_custom(true, true, None);
+
+    let network = Network::TestNetwork;
+    let uivk = test_uivk(&network);
+
+    // Create an invoice for 1.0 ZEC (100_000_000 zatoshis)
+    let inv = create_invoice(&store, &uivk, &network, 100_000_000, 3600).unwrap();
+
+    // Customer overpays: pays 1.5 ZEC (150_000_000 zatoshis)
+    {
+        let conn = store.conn().lock().unwrap();
+        conn.execute(
+            "INSERT INTO payments (address_index, txid, output_index, pool, value_zatoshi, block_height, block_hash, block_time)
+             VALUES (?1, 'dummy_txid_overpay_test', 0, 'orchard', 150000000, 100, 'hash100', 0)",
+            [inv.address_index],
+        )
+        .unwrap();
+    }
+
+    // Mark invoice Paid
+    store.mark_paid(&inv.public_id).unwrap();
+
+    let session = session_mgr.create_session();
+    let req = Request::builder()
+        .uri("/merchant?filter=all")
+        .header(COOKIE, format!("{}={}", SESSION_COOKIE_NAME, session.token))
+        .body(Body::empty())
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_body_string(res).await;
+
+    // Total Paid Volume must show the amount ACTUALLY received (1.5 ZEC), not invoice amount (1.0 ZEC)
+    assert!(
+        body.contains("<div class=\"total-label\">Total Paid Volume</div>\n            <div class=\"total-value\">1.5 ZEC</div>"),
+        "Total paid volume card must show 1.5 ZEC actually received, got body: {body}"
+    );
+}
+
+#[test]
+fn test_open_store_creates_parent_directories() {
+    let temp_dir = std::env::temp_dir();
+    let nested_db_dir = temp_dir
+        .join("test_veilgate_parent_dir_creation")
+        .join("subfolder");
+    let db_path = nested_db_dir.join("test.db");
+
+    if nested_db_dir.exists() {
+        let _ = std::fs::remove_dir_all(&nested_db_dir);
+    }
+
+    assert!(!nested_db_dir.exists());
+
+    let store_res = open_store(&db_path);
+    assert!(store_res.is_ok());
+    assert!(nested_db_dir.exists(), "Parent directory must be created");
+
+    drop(store_res);
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_dir_all(temp_dir.join("test_veilgate_parent_dir_creation"));
+}
+
+#[test]
+fn test_resolve_listen_address_from_config() {
+    use crate::web::handlers::resolve_listen_address_from_config;
+
+    let cli_addr: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+    // 1. When --listen is explicitly given on CLI, it takes precedence over PORT
+    let res = resolve_listen_address_from_config(Some(cli_addr), Some("10000"), None, true).unwrap();
+    assert_eq!(res, cli_addr);
+
+    // 2. When --listen is NOT given on CLI, PORT is used (binds to 0.0.0.0:$PORT)
+    let res_port = resolve_listen_address_from_config(None, Some("10000"), None, false).unwrap();
+    assert_eq!(res_port, "0.0.0.0:10000".parse::<SocketAddr>().unwrap());
+
+    // 3. When --listen is NOT given on CLI and PORT is not set, VEILGATE_LISTEN is used
+    let res_env = resolve_listen_address_from_config(None, None, Some("192.168.1.10:8080"), false).unwrap();
+    assert_eq!(res_env, "192.168.1.10:8080".parse::<SocketAddr>().unwrap());
+
+    // 4. When nothing is set, defaults to 127.0.0.1:8080
+    let res_default = resolve_listen_address_from_config(None, None, None, false).unwrap();
+    assert_eq!(res_default, "127.0.0.1:8080".parse::<SocketAddr>().unwrap());
+
+    // 5. Invalid PORT returns an error
+    let res_err = resolve_listen_address_from_config(None, Some("not_a_valid_port"), None, false);
+    assert!(res_err.is_err());
+}
+
+
 

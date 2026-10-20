@@ -1,0 +1,12 @@
+target/
+**/target/
+.veilgate/
+*.db
+*.sqlite
+*.sqlite3
+.git/
+docs/design/
+.env
+.env.*
+*.key
+*.seed

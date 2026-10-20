@@ -41,6 +41,44 @@ pub fn load_viewing_key(
     Ok(uivk)
 }
 
+/// Decodes an encoded incoming viewing key string for the specified network.
+///
+/// Returns a generic error if the key is empty, invalid, or for the wrong network.
+/// The input string and internal error details are NEVER included in the returned error.
+pub fn parse_viewing_key(
+    encoded: &str,
+    network: &Network,
+) -> Result<UnifiedIncomingViewingKey> {
+    let trimmed = encoded.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("Invalid viewing key or key for wrong network"));
+    }
+
+    UnifiedIncomingViewingKey::decode(network, trimmed)
+        .map_err(|_| anyhow!("Invalid viewing key or key for wrong network"))
+}
+
+/// Resolves the incoming viewing key, giving precedence to an environment variable value
+/// (`VEILGATE_VIEWING_KEY`) over the disk file path.
+///
+/// If an encoded key is provided via `env_key_var`, it is parsed and takes precedence.
+/// Any invalid key results in a generic error that never leaks the key.
+/// If `env_key_var` is None or empty, loads the viewing key from `file_path`.
+pub fn resolve_viewing_key(
+    env_key_var: Option<&str>,
+    file_path: impl AsRef<Path>,
+    network: &Network,
+) -> Result<UnifiedIncomingViewingKey> {
+    if let Some(key_str) = env_key_var {
+        let trimmed = key_str.trim();
+        if !trimmed.is_empty() {
+            return parse_viewing_key(trimmed, network);
+        }
+    }
+
+    load_viewing_key(file_path, network)
+}
+
 /// Derives a single shielded invoice address at the specified diversifier index.
 ///
 /// Uses `UnifiedAddressRequest::ORCHARD` so that the generated address contains
@@ -231,5 +269,87 @@ mod tests {
         let foreign_addr = invoice_address(&other_uivk, &net, 2).unwrap();
 
         assert_eq!(find_invoice_index(&uivk, &foreign_addr), None);
+    }
+
+    #[test]
+    fn test_parse_viewing_key_valid_and_wrong_network() {
+        let net = Network::TestNetwork;
+        let test_u = test_uivk(&net);
+        let encoded_test = test_u.encode(&net);
+
+        // Valid testnet key decodes successfully
+        let parsed = parse_viewing_key(&encoded_test, &net);
+        assert!(parsed.is_ok());
+
+        // Mainnet key for testnet must be rejected with generic error
+        let main_u = test_uivk(&Network::MainNetwork);
+        let encoded_main = main_u.encode(&Network::MainNetwork);
+        let err_main = parse_viewing_key(&encoded_main, &net);
+        assert!(err_main.is_err());
+        let err_msg = err_main.unwrap_err().to_string();
+        assert_eq!(err_msg, "Invalid viewing key or key for wrong network");
+        // Ensure encoded key is never leaked in the error
+        assert!(!err_msg.contains(&encoded_main));
+
+        // Empty key rejected with generic error
+        let err_empty = parse_viewing_key("   ", &net);
+        assert!(err_empty.is_err());
+        assert_eq!(
+            err_empty.unwrap_err().to_string(),
+            "Invalid viewing key or key for wrong network"
+        );
+    }
+
+    #[test]
+    fn test_viewing_key_never_appears_in_error_output() {
+        let net = Network::TestNetwork;
+        let secret_canary = "SECRET_CANARY_DO_NOT_LEAK_987654321";
+
+        let result = parse_viewing_key(secret_canary, &net);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+
+        // Neither Display nor Debug formats of the error chain may contain the key
+        let display_str = err.to_string();
+        let debug_str = format!("{err:?}");
+        assert!(
+            !display_str.contains(secret_canary),
+            "Display format leaked secret viewing key: {display_str}"
+        );
+        assert!(
+            !debug_str.contains(secret_canary),
+            "Debug format leaked secret viewing key: {debug_str}"
+        );
+        assert_eq!(display_str, "Invalid viewing key or key for wrong network");
+    }
+
+    #[test]
+    fn test_resolve_viewing_key_precedence() {
+        let net = Network::TestNetwork;
+        let valid_uivk = test_uivk(&net);
+        let valid_encoded = valid_uivk.encode(&net);
+
+        let temp_dir = std::env::temp_dir();
+        let dummy_path = temp_dir.join("non_existent_key_for_precedence_test.txt");
+
+        // 1. Env key takes precedence over non-existent file path
+        let res_env = resolve_viewing_key(Some(&valid_encoded), &dummy_path, &net);
+        assert!(res_env.is_ok(), "Env key should succeed even if file does not exist");
+
+        // 2. Invalid env key takes precedence and fails with generic error (does not fallback to file)
+        let canary_secret = "LEAK_CHECK_SECRET_KEY_123";
+        let res_invalid_env = resolve_viewing_key(Some(canary_secret), &dummy_path, &net);
+        assert!(res_invalid_env.is_err());
+        let err_str = res_invalid_env.unwrap_err().to_string();
+        assert_eq!(err_str, "Invalid viewing key or key for wrong network");
+        assert!(!err_str.contains(canary_secret));
+
+        // 3. None env key falls back to file path
+        let existing_file = temp_dir.join("test_existing_key_fallback.txt");
+        fs::write(&existing_file, &valid_encoded).unwrap();
+        let res_fallback = resolve_viewing_key(None, &existing_file, &net);
+        assert!(res_fallback.is_ok());
+
+        let _ = fs::remove_file(existing_file);
     }
 }

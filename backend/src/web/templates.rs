@@ -565,6 +565,7 @@ pub fn render_demo_page(csrf_token: &str, error_msg: Option<&str>, repo_url: Opt
         <span class="eyebrow">TESTNET DEMO</span>
         <h1>Create a Testnet Invoice</h1>
         <p class="hero-subtext">Test VeilGate checkout in real-time. Enter an amount between 0.001 and 10 ZEC to derive a fresh shielded testnet address.</p>
+        <p class="form-help demo-notice">This demo instance may reset. Invoices are not guaranteed to persist.</p>
         {error_html}
         <form method="POST" action="/demo" id="demo-form">
             <input type="hidden" name="csrf_token" value="{csrf_token}">
@@ -718,7 +719,7 @@ pub fn render_merchant_dashboard(
     let total_paid_zatoshi: u64 = invoices
         .iter()
         .filter(|i| i.invoice.status == InvoiceStatus::Paid)
-        .map(|i| i.invoice.amount_zatoshi)
+        .map(|i| i.received_zatoshi)
         .sum();
 
     let total_volume = esc(&format_zec_display(total_volume_zatoshi));

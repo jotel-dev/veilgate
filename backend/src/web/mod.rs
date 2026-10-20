@@ -56,6 +56,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/merchant/invoices", post(merchant_create_invoice_post))
         .route("/merchant/logout", post(merchant_logout_post))
         .route("/demo", get(demo_get).post(demo_post))
+        .route("/healthz", get(healthz_handler))
         .layer(DefaultBodyLimit::max(8192))
         .layer(from_fn_with_state(state.clone(), security_headers_middleware))
         .layer(tower_layers)

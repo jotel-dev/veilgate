@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: veilgate
+    runtime: docker
+    plan: free
+    healthCheckPath: /healthz
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: VEILGATE_VIEWING_KEY
+        sync: false
+      - key: VEILGATE_PASSWORD_HASH
+        sync: false
+      - key: VEILGATE_DEMO
+        value: "1"
+      - key: VEILGATE_CONFIRMATIONS
+        value: "3"
+      - key: VEILGATE_TRUSTED_PROXY_HEADER
+        value: x-forwarded-for
+      - key: VEILGATE_LIGHTWALLETD_URL
+        value: https://testnet.zec.rocks:443
+      - key: VEILGATE_DB_PATH
+        value: /app/data/veilgate.db
+      - key: VEILGATE_REPO_URL
+        sync: false
