@@ -1,12 +1,14 @@
 services:
   - type: web
     name: veilgate
-    runtime: docker
+    runtime: image
+    image:
+      url: ghcr.io/jotel-dev/veilgate:latest
     plan: free
     healthCheckPath: /healthz
     envVars:
       - key: PORT
-        value: 10000
+        value: "10000"
       - key: VEILGATE_VIEWING_KEY
         sync: false
       - key: VEILGATE_PASSWORD_HASH
@@ -22,4 +24,4 @@ services:
       - key: VEILGATE_DB_PATH
         value: /app/data/veilgate.db
       - key: VEILGATE_REPO_URL
-        sync: false
+        value: https://github.com/jotel-dev/veilgate

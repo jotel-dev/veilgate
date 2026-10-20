@@ -1997,5 +1997,77 @@ fn test_resolve_listen_address_from_config() {
     assert!(res_err.is_err());
 }
 
+#[test]
+fn test_render_yaml_image_deploy_spec() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let render_yaml_path = repo_root.join("render.yaml");
+    assert!(render_yaml_path.exists(), "render.yaml must exist");
+
+    let content = std::fs::read_to_string(&render_yaml_path).expect("read render.yaml");
+
+    // Must declare runtime: image with prebuilt ghcr.io image
+    assert!(content.contains("runtime: image"), "render.yaml must use runtime: image");
+    assert!(content.contains("url: ghcr.io/jotel-dev/veilgate:latest"), "render.yaml must reference prebuilt image");
+    assert!(content.contains("plan: free"), "render.yaml must specify free plan");
+    assert!(content.contains("healthCheckPath: /healthz"), "render.yaml must use /healthz health check");
+
+    // Secrets must have sync: false
+    assert!(content.contains("key: VEILGATE_VIEWING_KEY"));
+    assert!(content.contains("key: VEILGATE_PASSWORD_HASH"));
+    assert!(content.contains("sync: false"));
+
+    // Required environment variables
+    assert!(content.contains("key: VEILGATE_DEMO"));
+    assert!(content.contains("key: VEILGATE_TRUSTED_PROXY_HEADER"));
+    assert!(content.contains("value: x-forwarded-for"));
+    assert!(content.contains("key: VEILGATE_LIGHTWALLETD_URL"));
+    assert!(content.contains("key: VEILGATE_DB_PATH"));
+}
+
+#[test]
+fn test_github_actions_docker_workflow_spec() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let workflow_path = repo_root.join(".github").join("workflows").join("docker.yml");
+    assert!(workflow_path.exists(), ".github/workflows/docker.yml must exist");
+
+    let content = std::fs::read_to_string(&workflow_path).expect("read docker.yml");
+
+    // Triggers
+    assert!(content.contains("push:"), "must trigger on push");
+    assert!(content.contains("- main"), "must trigger on main branch");
+    assert!(content.contains("workflow_dispatch:"), "must support workflow_dispatch");
+    assert!(content.contains("'backend/**'") || content.contains("backend/**"));
+    assert!(content.contains("'Dockerfile'") || content.contains("Dockerfile"));
+    assert!(content.contains("'.dockerignore'") || content.contains(".dockerignore"));
+
+    // Permissions limited to contents: read and packages: write
+    assert!(content.contains("contents: read"));
+    assert!(content.contains("packages: write"));
+
+    // First job step runs cargo test
+    assert!(content.contains("cargo test"), "must run cargo test before building");
+
+    // Official pinned actions only
+    assert!(content.contains("actions/checkout@v4"));
+    assert!(content.contains("docker/setup-buildx-action@v3"));
+    assert!(content.contains("docker/login-action@v3"));
+    assert!(content.contains("docker/metadata-action@v5"));
+    assert!(content.contains("docker/build-push-action@v6"));
+
+    // Container registry target
+    assert!(content.contains("ghcr.io"));
+    assert!(content.contains("ghcr.io/jotel-dev/veilgate"));
+
+    // Tag generation: latest and sha-<shortsha>
+    assert!(content.contains("type=raw,value=latest"));
+    assert!(content.contains("type=sha,prefix=sha-,format=short"));
+
+    // Verification step
+    assert!(content.contains(".veilgate"), "must check for .veilgate");
+    assert!(content.contains("*.db"), "must check for *.db");
+    assert!(content.contains(".env*"), "must check for .env*");
+    assert!(content.contains("docs/design"), "must check for docs/design");
+}
+
 
 
