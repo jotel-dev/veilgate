@@ -88,6 +88,7 @@ Ensure the following environment variables are set in the Render Dashboard (prec
 | `VEILGATE_LIGHTWALLETD_URL` | `https://testnet.zec.rocks:443` | gRPC TLS endpoint for the testnet lightwalletd service. |
 | `VEILGATE_DB_PATH` | `/app/data/veilgate.db` | Path to SQLite database file on container filesystem. |
 | `VEILGATE_REPO_URL` | `https://github.com/jotel-dev/veilgate` | Link to public repository displayed in web footer. |
+| `VEILGATE_SHOWCASE` | *(optional)* | Six comma-separated fields: `index,amount_zatoshi,public_id,scan_from_height,scan_to_height,label`. On a brand new, empty database, seeds this showcase invoice, advances `next_address_index` to `index+1`, runs a one-time bounded background scan pass over `[scan_from_height, scan_to_height]` to re-detect the payment, and sets the main cursor to `tip - 100` without blocking web startup. The label must not contain commas. |
 
 ### Step 7: Check /healthz
 

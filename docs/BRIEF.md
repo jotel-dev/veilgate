@@ -16,7 +16,7 @@ addresses.rs (viewing key loading, one Orchard-receiver address per invoice inde
 ## Honest claims only
 Never invent statistics, user or merchant counts, uptime figures, testimonials, pricing, accounts or sign-up, an API, or "instant" settlement. Never mention other chains or currencies (no Solana, no USDC). Never say "anonymous" or "untraceable". True statements we may make:
 - Public observers cannot see the sender, receiver or amount of a payment made from a shielded balance to a shielded address. Funds moved in from a transparent address are visible at that step.
-- The merchant server sees the amount and arrival time of each payment, and any memo the customer's wallet includes (we do not request one).
+- The merchant server sees the amount and arrival time of each payment. VeilGate's scanner reads compact blocks, which do not carry memos, so VeilGate neither reads nor stores memos. A holder of the viewing key could read memos by downloading full transactions. Fauzec's page states its payments carry a default receipt memo; VeilGate does not read it.
 - The lightwalletd operator sees the scanner's IP address and which blocks it requests, but not which payments are ours.
 - The server holds an incoming viewing key: it can detect payments but cannot spend them.
 - Each invoice has its own address, so payments are matched without memos.
