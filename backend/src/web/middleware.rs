@@ -76,6 +76,9 @@ pub async fn security_headers_middleware(
     if is_sensitive {
         headers.insert("x-robots-tag", HeaderValue::from_static("noindex"));
         headers.insert("cache-control", HeaderValue::from_static("no-store"));
+    } else if path == "/" || path == "/privacy" {
+        // HTML must always revalidate so it never pairs with stale CSS/JS after a redeploy
+        headers.insert("cache-control", HeaderValue::from_static("no-cache"));
     }
 
     resp

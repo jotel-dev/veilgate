@@ -74,6 +74,10 @@ pub struct Invoice {
     pub is_late: bool,
     /// Flag indicating whether this is an isolated demo invoice.
     pub is_demo: bool,
+    /// Flag indicating whether this is a seeded showcase invoice.
+    pub is_showcase: bool,
+    /// Optional label (e.g. for showcase invoices).
+    pub label: Option<String>,
 }
 
 impl Invoice {
@@ -147,7 +151,9 @@ pub fn open_store(path: impl AsRef<Path>) -> Result<Store> {
             expires_at INTEGER NOT NULL,
             status TEXT NOT NULL,
             is_late INTEGER NOT NULL DEFAULT 0,
-            is_demo INTEGER NOT NULL DEFAULT 0
+            is_demo INTEGER NOT NULL DEFAULT 0,
+            is_showcase INTEGER NOT NULL DEFAULT 0,
+            label TEXT
          );
 
          CREATE TABLE IF NOT EXISTS payments (
@@ -178,6 +184,18 @@ pub fn open_store(path: impl AsRef<Path>) -> Result<Store> {
     if !column_exists(&conn, "invoices", "is_demo")? {
         conn.execute(
             "ALTER TABLE invoices ADD COLUMN is_demo INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !column_exists(&conn, "invoices", "is_showcase")? {
+        conn.execute(
+            "ALTER TABLE invoices ADD COLUMN is_showcase INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !column_exists(&conn, "invoices", "label")? {
+        conn.execute(
+            "ALTER TABLE invoices ADD COLUMN label TEXT",
             [],
         )?;
     }
@@ -285,8 +303,8 @@ pub fn create_invoice_internal(
 
     tx.execute(
         "INSERT INTO invoices (
-            address_index, public_id, amount_zatoshi, address, created_at, expires_at, status, is_late, is_demo
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, ?7)",
+            address_index, public_id, amount_zatoshi, address, created_at, expires_at, status, is_late, is_demo, is_showcase, label
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, ?7, 0, NULL)",
         params![
             allocated_index,
             public_id,
@@ -316,6 +334,8 @@ pub fn create_invoice_internal(
         status,
         is_late: false,
         is_demo,
+        is_showcase: false,
+        label: None,
     })
 }
 
@@ -351,7 +371,7 @@ pub fn get_by_public_id(store: &Store, id: &str) -> Result<Option<Invoice>> {
         .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
 
     let mut stmt = conn.prepare(
-        "SELECT address_index, public_id, amount_zatoshi, address, created_at, expires_at, status, is_late, is_demo
+        "SELECT address_index, public_id, amount_zatoshi, address, created_at, expires_at, status, is_late, is_demo, is_showcase, label
          FROM invoices WHERE public_id = ?1",
     )?;
 
@@ -366,6 +386,8 @@ pub fn get_by_public_id(store: &Store, id: &str) -> Result<Option<Invoice>> {
         let db_status: String = row.get(6)?;
         let is_late_i64: i64 = row.get(7).unwrap_or(0);
         let is_demo_i64: i64 = row.get(8).unwrap_or(0);
+        let is_showcase_i64: i64 = row.get(9).unwrap_or(0);
+        let label: Option<String> = row.get(10).ok().flatten();
 
         let amount_zatoshi = u64::try_from(amount_i64)
             .map_err(|e| anyhow!("Negative amount in database: {e}"))?;
@@ -391,6 +413,8 @@ pub fn get_by_public_id(store: &Store, id: &str) -> Result<Option<Invoice>> {
             status,
             is_late: is_late_i64 != 0,
             is_demo: is_demo_i64 != 0,
+            is_showcase: is_showcase_i64 != 0,
+            label,
         }))
     } else {
         Ok(None)
@@ -407,7 +431,7 @@ pub fn list_invoices(store: &Store) -> Result<Vec<Invoice>> {
         .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
 
     let mut stmt = conn.prepare(
-        "SELECT address_index, public_id, amount_zatoshi, address, created_at, expires_at, status, is_late, is_demo
+        "SELECT address_index, public_id, amount_zatoshi, address, created_at, expires_at, status, is_late, is_demo, is_showcase, label
          FROM invoices ORDER BY address_index ASC",
     )?;
 
@@ -426,6 +450,8 @@ pub fn list_invoices(store: &Store) -> Result<Vec<Invoice>> {
         let db_status: String = row.get(6)?;
         let is_late_i64: i64 = row.get(7).unwrap_or(0);
         let is_demo_i64: i64 = row.get(8).unwrap_or(0);
+        let is_showcase_i64: i64 = row.get(9).unwrap_or(0);
+        let label: Option<String> = row.get(10).ok().flatten();
 
         let amount_zatoshi = u64::try_from(amount_i64)
             .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Integer, Box::new(e)))?;
@@ -446,6 +472,8 @@ pub fn list_invoices(store: &Store) -> Result<Vec<Invoice>> {
             status,
             is_late: is_late_i64 != 0,
             is_demo: is_demo_i64 != 0,
+            is_showcase: is_showcase_i64 != 0,
+            label,
         })
     })?;
 
@@ -498,7 +526,7 @@ pub fn get_by_address_index(store: &Store, index: u32) -> Result<Option<Invoice>
         .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
 
     let mut stmt = conn.prepare(
-        "SELECT address_index, public_id, amount_zatoshi, address, created_at, expires_at, status, is_late, is_demo
+        "SELECT address_index, public_id, amount_zatoshi, address, created_at, expires_at, status, is_late, is_demo, is_showcase, label
          FROM invoices WHERE address_index = ?1",
     )?;
 
@@ -513,6 +541,8 @@ pub fn get_by_address_index(store: &Store, index: u32) -> Result<Option<Invoice>
         let db_status: String = row.get(6)?;
         let is_late_i64: i64 = row.get(7).unwrap_or(0);
         let is_demo_i64: i64 = row.get(8).unwrap_or(0);
+        let is_showcase_i64: i64 = row.get(9).unwrap_or(0);
+        let label: Option<String> = row.get(10).ok().flatten();
 
         let amount_zatoshi = u64::try_from(amount_i64)
             .map_err(|e| anyhow!("Negative amount in database: {e}"))?;
@@ -538,10 +568,237 @@ pub fn get_by_address_index(store: &Store, index: u32) -> Result<Option<Invoice>
             status,
             is_late: is_late_i64 != 0,
             is_demo: is_demo_i64 != 0,
+            is_showcase: is_showcase_i64 != 0,
+            label,
         }))
     } else {
         Ok(None)
     }
+}
+
+/// Parsed showcase invoice configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShowcaseConfig {
+    pub index: u32,
+    pub amount_zatoshi: u64,
+    pub public_id: String,
+    pub scan_from_height: u64,
+    pub scan_to_height: u64,
+    pub label: String,
+}
+
+impl ShowcaseConfig {
+    /// Parses a showcase specification strictly from a string.
+    /// Expected format: "index,amount_zatoshi,public_id,scan_from_height,scan_to_height,label"
+    pub fn parse(raw: &str) -> Result<Self> {
+        let parts: Vec<&str> = raw.split(',').collect();
+        if parts.len() != 6 {
+            return Err(anyhow!("Invalid showcase config: expected 6 comma-separated fields"));
+        }
+
+        let index: u32 = parts[0]
+            .trim()
+            .parse()
+            .map_err(|_| anyhow!("Invalid index in showcase config"))?;
+        if index < FIRST_INVOICE_INDEX {
+            return Err(anyhow!(
+                "Showcase index {index} must be >= {FIRST_INVOICE_INDEX}"
+            ));
+        }
+
+        let amount_zatoshi: u64 = parts[1]
+            .trim()
+            .parse()
+            .map_err(|_| anyhow!("Invalid amount_zatoshi in showcase config"))?;
+        if amount_zatoshi == 0 || amount_zatoshi > MAX_ZATOSHI {
+            return Err(anyhow!("Invalid amount_zatoshi in showcase config"));
+        }
+
+        let public_id = parts[2].trim().to_ascii_lowercase();
+        if public_id.len() != 32 || !public_id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(anyhow!(
+                "Invalid public_id in showcase config: must be 32 hex chars"
+            ));
+        }
+
+        let scan_from_height: u64 = parts[3]
+            .trim()
+            .parse()
+            .map_err(|_| anyhow!("Invalid scan_from_height in showcase config"))?;
+
+        let scan_to_height: u64 = parts[4]
+            .trim()
+            .parse()
+            .map_err(|_| anyhow!("Invalid scan_to_height in showcase config"))?;
+        if scan_to_height < scan_from_height {
+            return Err(anyhow!(
+                "Invalid scan_to_height {scan_to_height} < scan_from_height {scan_from_height}"
+            ));
+        }
+
+        let label = parts[5].trim().to_string();
+        if label.is_empty() {
+            return Err(anyhow!("Showcase label cannot be empty"));
+        }
+
+        Ok(Self {
+            index,
+            amount_zatoshi,
+            public_id,
+            scan_from_height,
+            scan_to_height,
+            label,
+        })
+    }
+}
+
+/// Parses VEILGATE_SHOWCASE environment variable strictly.
+/// Returns None and logs a generic notice if malformed.
+pub fn parse_showcase_env(env_val: &str) -> Option<ShowcaseConfig> {
+    match ShowcaseConfig::parse(env_val) {
+        Ok(cfg) => Some(cfg),
+        Err(_) => {
+            eprintln!("Notice: Invalid VEILGATE_SHOWCASE configuration. Ignoring showcase setup.");
+            None
+        }
+    }
+}
+
+/// Retrieves the seeded showcase invoice if one exists.
+pub fn get_showcase_invoice(store: &Store) -> Result<Option<Invoice>> {
+    let conn = store
+        .conn
+        .lock()
+        .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
+
+    let mut stmt = conn.prepare(
+        "SELECT address_index, public_id, amount_zatoshi, address, created_at, expires_at, status, is_late, is_demo, is_showcase, label
+         FROM invoices WHERE is_showcase = 1 LIMIT 1",
+    )?;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut rows = stmt.query([])?;
+    if let Some(row) = rows.next()? {
+        let address_index: u32 = row.get(0)?;
+        let public_id: String = row.get(1)?;
+        let amount_i64: i64 = row.get(2)?;
+        let address: String = row.get(3)?;
+        let created_i64: i64 = row.get(4)?;
+        let expires_i64: i64 = row.get(5)?;
+        let db_status: String = row.get(6)?;
+        let is_late_i64: i64 = row.get(7).unwrap_or(0);
+        let is_demo_i64: i64 = row.get(8).unwrap_or(0);
+        let is_showcase_i64: i64 = row.get(9).unwrap_or(0);
+        let label: Option<String> = row.get(10).ok().flatten();
+
+        let amount_zatoshi = u64::try_from(amount_i64)
+            .map_err(|e| anyhow!("Negative amount in database: {e}"))?;
+        let created_at = u64::try_from(created_i64)
+            .map_err(|e| anyhow!("Negative created_at in database: {e}"))?;
+        let expires_at = u64::try_from(expires_i64)
+            .map_err(|e| anyhow!("Negative expires_at in database: {e}"))?;
+
+        let status = evaluate_status(&db_status, expires_at, now);
+
+        Ok(Some(Invoice {
+            address_index,
+            public_id,
+            amount_zatoshi,
+            address,
+            created_at,
+            expires_at,
+            status,
+            is_late: is_late_i64 != 0,
+            is_demo: is_demo_i64 != 0,
+            is_showcase: is_showcase_i64 != 0,
+            label,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Seeds the showcase invoice if the database is brand new and empty.
+///
+/// If any invoices already exist in the database, does nothing and returns Ok(false).
+/// When seeded:
+/// - Address is derived from index using standard derivation.
+/// - Next-index counter is set to index + 1 so indices are never reused.
+/// - Scan cursor is set to scan_from_height so the scanner re-reads the chain and re-detects the payment.
+pub fn init_showcase_invoice(
+    store: &Store,
+    uivk: &UnifiedIncomingViewingKey,
+    network: &Network,
+    config: &ShowcaseConfig,
+) -> Result<bool> {
+    let mut conn = store
+        .conn
+        .lock()
+        .map_err(|e| anyhow!("Failed to acquire database lock: {e}"))?;
+
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+    let invoice_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM invoices",
+        [],
+        |row| row.get(0),
+    )?;
+
+    if invoice_count > 0 {
+        return Ok(false);
+    }
+
+    let ua = invoice_address(uivk, network, config.index)?;
+    let address_str = encode_address(&ua, network);
+
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| anyhow!("System clock error: {e}"))?
+        .as_secs();
+
+    // Far future expiration (10 years)
+    let expires_at = created_at.saturating_add(10 * 365 * 86400);
+
+    let amount_i64 = i64::try_from(config.amount_zatoshi)
+        .map_err(|e| anyhow!("Amount exceeds i64 range: {e}"))?;
+    let created_i64 = i64::try_from(created_at)
+        .map_err(|e| anyhow!("Created timestamp exceeds i64 range: {e}"))?;
+    let expires_i64 = i64::try_from(expires_at)
+        .map_err(|e| anyhow!("Expires timestamp exceeds i64 range: {e}"))?;
+
+    tx.execute(
+        "INSERT INTO invoices (
+            address_index, public_id, amount_zatoshi, address, created_at, expires_at, status, is_late, is_demo, is_showcase, label
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, 0, 1, ?7)",
+        params![
+            config.index,
+            config.public_id,
+            amount_i64,
+            address_str,
+            created_i64,
+            expires_i64,
+            config.label,
+        ],
+    )?;
+
+    // Set next-index counter to index + 1 (never reuse indices)
+    let next_index = config
+        .index
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("Address index counter overflowed"))?;
+
+    tx.execute(
+        "INSERT INTO invoice_meta (key, value) VALUES ('next_address_index', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = MAX(value, excluded.value)",
+        [next_index],
+    )?;
+
+    tx.commit()?;
+    Ok(true)
 }
 
 /// Marks an invoice as paid by address index, specifying whether the payment was confirmed late.
@@ -919,6 +1176,21 @@ impl Store {
     /// Retrieves an invoice by public ID within this store.
     pub fn get_by_public_id(&self, id: &str) -> Result<Option<Invoice>> {
         get_by_public_id(self, id)
+    }
+
+    /// Retrieves the seeded showcase invoice if present.
+    pub fn get_showcase_invoice(&self) -> Result<Option<Invoice>> {
+        get_showcase_invoice(self)
+    }
+
+    /// Initializes the showcase invoice if the database is brand new and empty.
+    pub fn init_showcase_invoice(
+        &self,
+        uivk: &UnifiedIncomingViewingKey,
+        network: &Network,
+        config: &ShowcaseConfig,
+    ) -> Result<bool> {
+        init_showcase_invoice(self, uivk, network, config)
     }
 
     /// Retrieves an invoice by address index within this store.
@@ -1409,6 +1681,7 @@ mod tests {
 
             assert!(!column_exists(&conn, "invoices", "is_late").unwrap());
             assert!(!column_exists(&conn, "invoices", "is_demo").unwrap());
+            assert!(!column_exists(&conn, "invoices", "is_showcase").unwrap());
             assert!(!column_exists(&conn, "payments", "block_time").unwrap());
         }
 
@@ -1418,6 +1691,7 @@ mod tests {
 
         assert!(column_exists(&conn, "invoices", "is_late").unwrap());
         assert!(column_exists(&conn, "invoices", "is_demo").unwrap());
+        assert!(column_exists(&conn, "invoices", "is_showcase").unwrap());
         assert!(column_exists(&conn, "payments", "block_time").unwrap());
 
         // Opening again should be idempotent and not fail
@@ -1427,6 +1701,7 @@ mod tests {
         let conn2 = store2.conn().lock().unwrap();
         assert!(column_exists(&conn2, "invoices", "is_late").unwrap());
         assert!(column_exists(&conn2, "invoices", "is_demo").unwrap());
+        assert!(column_exists(&conn2, "invoices", "is_showcase").unwrap());
         assert!(column_exists(&conn2, "payments", "block_time").unwrap());
         drop(conn2);
         drop(store2);
@@ -1466,6 +1741,214 @@ mod tests {
         // Ensure next invoice NEVER reuses index 3, and gets index 5
         let next_inv = create_invoice(&store, &uivk, &net, 300_000, 3600).unwrap();
         assert_eq!(next_inv.address_index, 5);
+    }
+
+    #[test]
+    fn test_showcase_seeded_only_on_empty_database() {
+        let store = open_store(":memory:").unwrap();
+        let net = Network::TestNetwork;
+        let uivk = test_uivk(&net);
+
+        let cfg = ShowcaseConfig {
+            index: 42,
+            amount_zatoshi: 1_000_000,
+            public_id: "0123456789abcdef0123456789abcdef".to_string(),
+            scan_from_height: 3_500_000,
+            scan_to_height: 3_500_500,
+            label: "Faucet test payment".to_string(),
+        };
+
+        // 1. First seeding on empty database succeeds
+        let seeded = init_showcase_invoice(&store, &uivk, &net, &cfg).unwrap();
+        assert!(seeded, "Showcase must be seeded on empty database");
+
+        // Verify showcase invoice exists in DB
+        let showcase = get_showcase_invoice(&store).unwrap();
+        assert!(showcase.is_some());
+        let inv = showcase.unwrap();
+        assert_eq!(inv.address_index, 42);
+        assert_eq!(inv.amount_zatoshi, 1_000_000);
+        assert_eq!(inv.public_id, "0123456789abcdef0123456789abcdef");
+        assert!(inv.is_showcase);
+        assert!(!inv.is_demo);
+        assert_eq!(inv.status, InvoiceStatus::Pending);
+        assert_eq!(inv.label.as_deref(), Some("Faucet test payment"));
+
+        // Main scan cursor is NOT parked at scan_from_height; it remains None
+        assert_eq!(
+            store.get_last_scanned_height().unwrap(),
+            None,
+            "Main scan cursor must not be parked at scan_from_height"
+        );
+
+        // 2. Second seeding attempt does nothing because DB is not empty
+        let cfg2 = ShowcaseConfig {
+            index: 99,
+            amount_zatoshi: 2_000_000,
+            public_id: "fedcba9876543210fedcba9876543210".to_string(),
+            scan_from_height: 4_000_000,
+            scan_to_height: 4_000_500,
+            label: "Another showcase".to_string(),
+        };
+        let seeded2 = init_showcase_invoice(&store, &uivk, &net, &cfg2).unwrap();
+        assert!(!seeded2, "Showcase must not be seeded if database is not empty");
+        // Ensure original showcase was not overwritten
+        let inv_check = get_showcase_invoice(&store).unwrap().unwrap();
+        assert_eq!(inv_check.address_index, 42);
+
+        // 3. New database where an invoice was already created does not seed showcase
+        let store2 = open_store(":memory:").unwrap();
+        create_invoice(&store2, &uivk, &net, 100_000, 3600).unwrap();
+        let seeded_non_empty = init_showcase_invoice(&store2, &uivk, &net, &cfg).unwrap();
+        assert!(!seeded_non_empty, "Showcase must not be seeded if DB already has invoices");
+        assert!(get_showcase_invoice(&store2).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_showcase_sets_counter_to_index_plus_one() {
+        let store = open_store(":memory:").unwrap();
+        let net = Network::TestNetwork;
+        let uivk = test_uivk(&net);
+
+        let showcase_index = 55;
+        let cfg = ShowcaseConfig {
+            index: showcase_index,
+            amount_zatoshi: 1_000_000,
+            public_id: "abcdefabcdefabcdefabcdefabcdefab".to_string(),
+            scan_from_height: 2_000_000,
+            scan_to_height: 2_000_500,
+            label: "Monotonic showcase".to_string(),
+        };
+
+        let seeded = init_showcase_invoice(&store, &uivk, &net, &cfg).unwrap();
+        assert!(seeded);
+
+        // Next invoice created must receive showcase_index + 1
+        let next_inv = create_invoice(&store, &uivk, &net, 100_000, 3600).unwrap();
+        assert_eq!(
+            next_inv.address_index,
+            showcase_index + 1,
+            "Next invoice must get index+1"
+        );
+
+        // Following invoice gets index+2
+        let following_inv = create_demo_invoice(&store, &uivk, &net, 100_000, 3600).unwrap();
+        assert_eq!(
+            following_inv.address_index,
+            showcase_index + 2,
+            "Subsequent invoice continues monotonically"
+        );
+    }
+
+    #[test]
+    fn test_showcase_malformed_env_ignored() {
+        // Missing fields
+        assert!(parse_showcase_env("").is_none());
+        assert!(parse_showcase_env("42,1000000,0123456789abcdef0123456789abcdef").is_none());
+        assert!(parse_showcase_env("42,1000000,0123456789abcdef0123456789abcdef,3000000").is_none());
+
+        // Five-field value must be rejected
+        assert!(
+            parse_showcase_env("2,1000000,0123456789abcdef0123456789abcdef,3000000,Faucet demo payment").is_none(),
+            "Five-field value must be rejected"
+        );
+
+        // Comma in label must be rejected
+        assert!(
+            parse_showcase_env("2,1000000,0123456789abcdef0123456789abcdef,3000000,3000500,Faucet, with comma").is_none(),
+            "Comma in label must be rejected"
+        );
+
+        // Invalid index
+        assert!(parse_showcase_env("abc,1000000,0123456789abcdef0123456789abcdef,3000000,3000500,label").is_none());
+        assert!(parse_showcase_env("0,1000000,0123456789abcdef0123456789abcdef,3000000,3000500,label").is_none());
+        assert!(parse_showcase_env("1,1000000,0123456789abcdef0123456789abcdef,3000000,3000500,label").is_none());
+
+        // Invalid amount
+        assert!(parse_showcase_env("2,0,0123456789abcdef0123456789abcdef,3000000,3000500,label").is_none());
+        assert!(parse_showcase_env("2,invalid,0123456789abcdef0123456789abcdef,3000000,3000500,label").is_none());
+
+        // Invalid public_id
+        assert!(parse_showcase_env("2,1000000,short_id,3000000,3000500,label").is_none());
+        assert!(parse_showcase_env("2,1000000,0123456789abcdef0123456789abcdeg,3000000,3000500,label").is_none()); // 'g' is not hex
+        assert!(parse_showcase_env("2,1000000,0123456789abcdef0123456789abcdef0,3000000,3000500,label").is_none()); // 33 chars
+
+        // Invalid scan heights
+        assert!(parse_showcase_env("2,1000000,0123456789abcdef0123456789abcdef,not_num,3000500,label").is_none());
+        assert!(parse_showcase_env("2,1000000,0123456789abcdef0123456789abcdef,3000000,not_num,label").is_none());
+        // scan_to_height < scan_from_height
+        assert!(parse_showcase_env("2,1000000,0123456789abcdef0123456789abcdef,3000500,3000000,label").is_none());
+
+        // Empty label
+        assert!(parse_showcase_env("2,1000000,0123456789abcdef0123456789abcdef,3000000,3000500,").is_none());
+        assert!(parse_showcase_env("2,1000000,0123456789abcdef0123456789abcdef,3000000,3000500,   ").is_none());
+
+        // Valid 6-field specification parses correctly
+        let valid = parse_showcase_env("2,1000000,0123456789abcdef0123456789abcdef,3000000,3000500,Faucet demo payment");
+        assert!(valid.is_some());
+        let cfg = valid.unwrap();
+        assert_eq!(cfg.index, 2);
+        assert_eq!(cfg.amount_zatoshi, 1_000_000);
+        assert_eq!(cfg.public_id, "0123456789abcdef0123456789abcdef");
+        assert_eq!(cfg.scan_from_height, 3_000_000);
+        assert_eq!(cfg.scan_to_height, 3_000_500);
+        assert_eq!(cfg.label, "Faucet demo payment");
+    }
+
+    #[test]
+    fn test_seeded_showcase_plus_synthetic_detected_note_reaches_paid_via_apply_detected() {
+        let store = open_store(":memory:").unwrap();
+        let net = Network::TestNetwork;
+        let uivk = test_uivk(&net);
+
+        let showcase_index = 10;
+        let amount = 1_000_000;
+        let cfg = ShowcaseConfig {
+            index: showcase_index,
+            amount_zatoshi: amount,
+            public_id: "11223344556677889900aabbccddeeff".to_string(),
+            scan_from_height: 1_000_000,
+            scan_to_height: 1_000_100,
+            label: "Faucet payment test".to_string(),
+        };
+
+        init_showcase_invoice(&store, &uivk, &net, &cfg).unwrap();
+
+        let inv_initial = get_by_address_index(&store, showcase_index).unwrap().unwrap();
+        assert_eq!(inv_initial.status, InvoiceStatus::Pending);
+
+        // Synthetic note for the showcase address index
+        let synthetic_note = crate::scanner::DetectedNote {
+            txid: "0101010101010101010101010101010101010101010101010101010101010101".to_string(),
+            output_index: 0,
+            pool: "Orchard".to_string(),
+            value_zatoshi: amount,
+            address_index: showcase_index,
+            block_height: 1_000_050,
+            block_hash: "0202020202020202020202020202020202020202020202020202020202020202".to_string(),
+            block_time: 12345678,
+        };
+
+        // Apply detected note with tip = 1_000_055 (5 confirmations >= 3 required)
+        let res = crate::scanner::apply_detected(&store, &[synthetic_note], 1_000_055, 3).unwrap();
+        assert_eq!(res.payments_detected, 1);
+        assert_eq!(res.invoices_paid, 1);
+
+        // Verify showcase invoice is now Paid in the store
+        let inv_paid = get_by_address_index(&store, showcase_index).unwrap().unwrap();
+        assert_eq!(inv_paid.status, InvoiceStatus::Paid);
+        assert!(!inv_paid.is_late);
+
+        // Verify invoice_payment_state reports Paid
+        let pstate = invoice_payment_state(&store, showcase_index, 1_000_055, 3).unwrap();
+        assert_eq!(
+            pstate,
+            InvoicePaymentState::Paid {
+                received: amount,
+                excess: 0,
+                late: false,
+            }
+        );
     }
 }
 

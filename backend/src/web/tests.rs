@@ -358,7 +358,7 @@ fn has_emoji(s: &str) -> bool {
 async fn test_rendered_pages_integrity_and_banned_words() {
     let landing = templates::render_landing_page(None, false);
     let privacy = templates::render_privacy_page(None, false);
-    let demo = templates::render_demo_page("test_csrf", None, None, false);
+    let demo = templates::render_demo_page("test_csrf", None, None, false, None);
     let login = templates::render_login_page("test_csrf", None, None);
 
     let pages = vec![
@@ -390,7 +390,7 @@ async fn test_rendered_pages_integrity_and_banned_words() {
         // No inline scripts or style attributes
         for script_chunk in html.split("<script").skip(1) {
             assert!(
-                script_chunk.starts_with(r#" src="/static/app.js" defer></script>"#),
+                script_chunk.starts_with(" src=\"/static/app.js?v=") && script_chunk.contains("\" defer></script>"),
                 "Page '{}' contains non-standard script tag",
                 name
             );
@@ -682,6 +682,7 @@ fn test_fix3_templates_render_pay_page_no_leak() {
             "zcash:test",
             None,
             false,
+            false,
         );
         assert!(html.contains(&label));
     }
@@ -698,6 +699,7 @@ fn test_fix3_templates_render_pay_page_no_leak() {
             50_000_000,
             "zcash:test",
             None,
+            false,
             false,
         );
         assert!(html.contains(&label));
@@ -1050,6 +1052,7 @@ async fn test_fix9_html_escaping() {
         Some("<bad'err\"&>"),
         None,
         false,
+        None,
     );
     assert!(!demo_html.contains("<bad'err\"&>"));
     assert!(demo_html.contains("&lt;bad&#x27;err&quot;&amp;&gt;"));
@@ -2069,5 +2072,592 @@ fn test_github_actions_docker_workflow_spec() {
     assert!(content.contains("docs/design"), "must check for docs/design");
 }
 
+#[tokio::test]
+async fn test_motion_polish_system_and_reduced_motion() {
+    let (app, store, session_mgr, _lim, public_id, _pw) =
+        setup_test_app_custom(true, true, None);
+    let session = session_mgr.create_session();
+
+    store.set_last_scanned_height(3120000).unwrap();
+    store.set_chain_tip(3126000).unwrap();
+    store.set_last_success_unix_time(1720001234).unwrap();
+    store.set_last_error_category("none").unwrap();
+
+    // 1. Verify no "style=" attribute in any rendered page
+    let pages = vec![
+        ("/".to_string(), None),
+        ("/privacy".to_string(), None),
+        ("/demo".to_string(), None),
+        (format!("/pay/{public_id}"), None),
+        ("/merchant/login".to_string(), None),
+        ("/merchant?filter=all".to_string(), Some(session.token.as_str())),
+    ];
+
+    for (path, cookie) in &pages {
+        let mut builder = Request::builder().uri(path);
+        if let Some(tok) = cookie {
+            builder = builder.header(COOKIE, format!("{}={}", SESSION_COOKIE_NAME, tok));
+        }
+        let req = builder.body(Body::empty()).unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "Failed to load {}", path);
+        let body = response_body_string(res).await;
+
+        assert!(!body.contains("style="), "Page {} contained style= attribute", path);
+        assert!(!body.contains("style ="), "Page {} contained style = attribute", path);
+
+        // Verify content renders without JavaScript (SSR complete content)
+        assert!(
+            body.contains("<main") || body.contains("checkout-card"),
+            "Page {} missing content in raw HTML",
+            path
+        );
+
+        // Verify banned words (including "Unix")
+        let banned_words = ["Solana", "USDC", "Pricing", "30,000", "uptime", "Unix"];
+        for word in banned_words {
+            assert!(
+                !body.contains(word),
+                "Page {} contained banned word '{}'",
+                path,
+                word
+            );
+        }
+    }
+
+    // 2. Static style.css verification
+    let req_css = Request::builder().uri("/static/style.css").body(Body::empty()).unwrap();
+    let res_css = app.clone().oneshot(req_css).await.unwrap();
+    assert_eq!(res_css.status(), StatusCode::OK);
+    let css = response_body_string(res_css).await;
+
+    // style.css contains a prefers-reduced-motion block that disables transforms and loops
+    assert!(
+        css.contains("@media (prefers-reduced-motion: reduce)"),
+        "style.css missing @media (prefers-reduced-motion: reduce)"
+    );
+    assert!(
+        css.contains("transform: none !important"),
+        "prefers-reduced-motion block must set transform: none !important"
+    );
+    assert!(
+        css.contains("animation: none !important"),
+        "prefers-reduced-motion block must set animation: none !important"
+    );
+
+    // Hidden pre-reveal selectors are all scoped under .js (html.js)
+    assert!(
+        css.contains("html.js .hero-content > *"),
+        "Pre-reveal hero items must be scoped under html.js"
+    );
+    assert!(
+        css.contains("html.js .feature-card"),
+        "Pre-reveal feature cards must be scoped under html.js"
+    );
+    assert!(
+        css.contains("html.js .band-section"),
+        "Pre-reveal band must be scoped under html.js"
+    );
+    assert!(
+        css.contains("html.js .step-card"),
+        "Pre-reveal step cards must be scoped under html.js"
+    );
+
+    // Stagger utility classes (.reveal-delay-1 to .reveal-delay-5)
+    for i in 1..=5 {
+        assert!(
+            css.contains(&format!(".reveal-delay-{i}")),
+            "style.css missing .reveal-delay-{}",
+            i
+        );
+    }
+
+    // 3. Static app.js verification
+    let req_js = Request::builder().uri("/static/app.js").body(Body::empty()).unwrap();
+    let res_js = app.clone().oneshot(req_js).await.unwrap();
+    assert_eq!(res_js.status(), StatusCode::OK);
+    let js = response_body_string(res_js).await;
+
+    // app.js adds .js class to documentElement
+    assert!(
+        js.contains("document.documentElement.classList.add('js')"),
+        "app.js must add 'js' class to documentElement"
+    );
+
+    // 4. Forbidden strings in CSS and JS
+    let forbidden = ["framer", "gsap", "react", "@import", "http"];
+    for word in forbidden {
+        assert!(
+            !css.to_lowercase().contains(word),
+            "style.css contained forbidden string: {}",
+            word
+        );
+        assert!(
+            !js.to_lowercase().contains(word),
+            "app.js contained forbidden string: {}",
+            word
+        );
+    }
+
+    // 5. Total added sizes
+    // Original CSS: 25,330 bytes; budget: +10 KB (< 10,240 bytes) -> max 35,570 bytes
+    // Original JS: 7,613 bytes; budget: +4 KB (< 4,096 bytes) -> max 11,709 bytes
+    let css_len = css.as_bytes().len();
+    let js_len = js.as_bytes().len();
+    assert!(
+        css_len <= 35570,
+        "style.css exceeded size budget: {} bytes (max 35570)",
+        css_len
+    );
+    assert!(
+        js_len <= 11709,
+        "app.js exceeded size budget: {} bytes (max 11709)",
+        js_len
+    );
+}
+
+#[tokio::test]
+async fn test_demo_page_defaults_and_sentence() {
+    let (app, _store, _pid, _pw) = setup_test_app(true);
+
+    let req = Request::builder().uri("/demo").body(Body::empty()).unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_body_string(res).await;
+
+    // Default amount is 0.01 ZEC
+    assert!(
+        body.contains(r#"value="0.01""#) && body.contains(r#"placeholder="0.01""#),
+        "Demo page must have default amount 0.01 ZEC"
+    );
+
+    // Default validity is 60 minutes
+    assert!(
+        body.contains(r#"name="validity_minutes" value="60""#),
+        "Demo page must have default validity 60 minutes"
+    );
+
+    // Allowed range is 0.001 to 10 ZEC
+    assert!(
+        body.contains("Allowed range: 0.001 to 10 ZEC (testnet)"),
+        "Demo page must state allowed range 0.001 to 10 ZEC"
+    );
+
+    // Sentence under the form
+    assert!(
+        body.contains("Testnet faucets pay between 0.1 and 1 test coin; a 0.01 invoice is covered by any of them."),
+        "Demo page must contain exact sentence under the form"
+    );
+}
+
+fn setup_test_app_empty(
+    demo_enabled: bool,
+) -> (
+    axum::Router,
+    Arc<Store>,
+    Arc<SessionManager>,
+    Arc<RateLimiter>,
+    String,
+) {
+    let store = Arc::new(open_store(":memory:").expect("open in-memory store"));
+    let network = Network::TestNetwork;
+    let uivk = test_uivk(&network);
+
+    let password = "correct_horse_battery_staple";
+    let password_hash = hash_password(password).expect("hash password");
+    let session_manager = Arc::new(SessionManager::new());
+    let rate_limiter = Arc::new(RateLimiter::new());
+
+    let state = AppState {
+        store: Arc::clone(&store),
+        uivk: Arc::new(uivk.clone()),
+        network,
+        confirmations: 3,
+        repo_url: None,
+        demo_enabled,
+        password_hash: Some(password_hash),
+        session_manager: Arc::clone(&session_manager),
+        rate_limiter: Arc::clone(&rate_limiter),
+        is_localhost: true,
+        trusted_proxy_header: None,
+    };
+
+    let app = build_app(state);
+    (app, store, session_manager, rate_limiter, password.to_string())
+}
+
+#[tokio::test]
+async fn test_showcase_excluded_from_demo_pending_cap() {
+    let (app, store, _session_mgr, _lim, _pw) = setup_test_app_empty(true);
+    let network = Network::TestNetwork;
+    let uivk = test_uivk(&network);
+
+    // Seed showcase invoice
+    let cfg = crate::invoices::ShowcaseConfig {
+        index: 5,
+        amount_zatoshi: 1_000_000,
+        public_id: "00112233445566778899aabbccddeeff".to_string(),
+        scan_from_height: 3_000_000,
+        scan_to_height: 3_000_500,
+        label: "Showcase demo".to_string(),
+    };
+    let seeded = crate::invoices::init_showcase_invoice(&store, &uivk, &network, &cfg).unwrap();
+    assert!(seeded, "Showcase must be seeded on empty DB");
+
+    // Now create 99 pending demo invoices
+    for _ in 0..99 {
+        create_demo_invoice(&store, &uivk, &network, 100_000, 3600).unwrap();
+    }
+
+    // Get a valid CSRF token from /demo
+    let req_csrf = Request::builder().uri("/demo").body(Body::empty()).unwrap();
+    let res_csrf = app.clone().oneshot(req_csrf).await.unwrap();
+    let csrf_cookie = res_csrf
+        .headers()
+        .get(SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let csrf_token = csrf_cookie
+        .split(';')
+        .next()
+        .unwrap()
+        .split('=')
+        .nth(1)
+        .unwrap();
+
+    // POST /demo to create the 100th demo invoice.
+    // If showcase were counted, total pending demo count would be 100 and this would fail with 429.
+    // Because showcase is excluded, total pending demo count is 99, so this succeeds with 303 Redirect!
+    let form_body = format!("csrf_token={}&amount=0.01&validity_minutes=60", csrf_token);
+    let req_post = Request::builder()
+        .method("POST")
+        .uri("/demo")
+        .header(COOKIE, format!("{}={}", CSRF_COOKIE_NAME, csrf_token))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from(form_body))
+        .unwrap();
+
+    let res_post = app.clone().oneshot(req_post).await.unwrap();
+    assert_eq!(
+        res_post.status(),
+        StatusCode::SEE_OTHER,
+        "POST /demo must succeed when 99 demo invoices exist plus 1 showcase invoice"
+    );
+}
+
+#[tokio::test]
+async fn test_showcase_ui_card_pay_notice_and_dashboard_badge() {
+    let (app, store, session_mgr, _lim, _pw) = setup_test_app_empty(true);
+    let network = Network::TestNetwork;
+    let uivk = test_uivk(&network);
+
+    let showcase_pid = "aabbccddeeff00112233445566778899";
+    let cfg = crate::invoices::ShowcaseConfig {
+        index: 12,
+        amount_zatoshi: 2_000_000,
+        public_id: showcase_pid.to_string(),
+        scan_from_height: 3_000_000,
+        scan_to_height: 3_000_500,
+        label: "Official Testnet Faucet Payment".to_string(),
+    };
+    let seeded = crate::invoices::init_showcase_invoice(&store, &uivk, &network, &cfg).unwrap();
+    assert!(seeded, "Showcase must be seeded on empty DB");
+
+    // 1. /demo page shows showcase card
+    let req_demo = Request::builder().uri("/demo").body(Body::empty()).unwrap();
+    let res_demo = app.clone().oneshot(req_demo).await.unwrap();
+    assert_eq!(res_demo.status(), StatusCode::OK);
+    let body_demo = response_body_string(res_demo).await;
+    assert!(body_demo.contains("See a real completed payment"));
+    assert!(body_demo.contains(&format!("/pay/{showcase_pid}")));
+    assert!(body_demo.contains("Official Testnet Faucet Payment"));
+    assert!(body_demo.contains("This invoice was paid on the Zcash testnet with a faucet payment; this server detected it with its watch-only key."));
+
+    // 2. /pay/<showcase_public_id> while scanner is catching up (far behind tip)
+    // Set cursor = 3_000_000, tip = 3_001_000 (1000 blocks behind >= 10)
+    store.set_last_scanned_height(3_000_000).unwrap();
+    store.set_chain_tip(3_001_000).unwrap();
+
+    let req_pay = Request::builder()
+        .uri(format!("/pay/{showcase_pid}"))
+        .body(Body::empty())
+        .unwrap();
+    let res_pay = app.clone().oneshot(req_pay).await.unwrap();
+    assert_eq!(res_pay.status(), StatusCode::OK);
+    let body_pay = response_body_string(res_pay).await;
+    // Shows normal Awaiting payment state
+    assert!(body_pay.contains("Awaiting payment"));
+    // Plus the re-reading line
+    assert!(body_pay.contains("This example is being re-read from the chain after a restart"));
+
+    // 3. When scanner caught up (e.g. cursor == tip), re-reading line is NOT shown
+    store.set_last_scanned_height(3_001_000).unwrap();
+    let req_pay_caught_up = Request::builder()
+        .uri(format!("/pay/{showcase_pid}"))
+        .body(Body::empty())
+        .unwrap();
+    let res_pay_caught_up = app.clone().oneshot(req_pay_caught_up).await.unwrap();
+    let body_pay_caught_up = response_body_string(res_pay_caught_up).await;
+    assert!(!body_pay_caught_up.contains("This example is being re-read from the chain after a restart"));
+
+    // 4. In merchant dashboard (/merchant?filter=all), showcase is marked with Showcase badge
+    let session = session_mgr.create_session();
+    let req_dash = Request::builder()
+        .uri("/merchant?filter=all")
+        .header(COOKIE, format!("{}={}", SESSION_COOKIE_NAME, session.token))
+        .body(Body::empty())
+        .unwrap();
+    let res_dash = app.clone().oneshot(req_dash).await.unwrap();
+    assert_eq!(res_dash.status(), StatusCode::OK);
+    let body_dash = response_body_string(res_dash).await;
+    assert!(body_dash.contains(r#"<span class="status-pill status-showcase">Showcase</span>"#));
+}
+
+#[tokio::test]
+async fn test_no_page_contains_the_viewing_key() {
+    let (app, _store, session_mgr, _lim, public_id, _pw) =
+        setup_test_app_custom(true, true, None);
+    let session = session_mgr.create_session();
+
+    let network = Network::TestNetwork;
+    let uivk = test_uivk(&network);
+    let key_encoded = uivk.encode(&network);
+
+    let pay_uri = format!("/pay/{public_id}");
+    let pages = vec![
+        ("/", None),
+        ("/privacy", None),
+        ("/demo", None),
+        ("/merchant/login", None),
+        (pay_uri.as_str(), None),
+        ("/merchant", Some(session.token.as_str())),
+        ("/merchant?filter=all", Some(session.token.as_str())),
+    ];
+
+    for (path, cookie) in pages {
+        let mut builder = Request::builder().uri(path);
+        if let Some(tok) = cookie {
+            builder = builder.header(COOKIE, format!("{}={}", SESSION_COOKIE_NAME, tok));
+        }
+        let req = builder.body(Body::empty()).unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "Failed on path {path}");
+        let body = response_body_string(res).await;
+
+        assert!(
+            !body.contains("uivktest"),
+            "Page {path} contains substring 'uivktest'!"
+        );
+        assert!(
+            !body.contains("uviewtest"),
+            "Page {path} contains substring 'uviewtest'!"
+        );
+        assert!(
+            !body.contains(&key_encoded),
+            "Page {path} contains full encoded viewing key string!"
+        );
+    }
+}
 
 
+
+
+
+// =========================================================================
+// Motion system: app pages never depend on JavaScript to become visible
+// =========================================================================
+
+fn strip_css_comments(css: &str) -> String {
+    let mut out = String::new();
+    let mut rest = css;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("*/") {
+            Some(end) => rest = &rest[start + end + 2..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Selectors (with the `html.js ` prefix removed) of every html.js rule that sets opacity: 0.
+fn pre_reveal_selectors(css: &str) -> Vec<String> {
+    let css = strip_css_comments(css);
+    let mut found = Vec::new();
+    for chunk in css.split('}') {
+        let Some((sel, body)) = chunk.split_once('{') else { continue };
+        if !body.contains("opacity: 0;") {
+            continue;
+        }
+        for s in sel.split(',') {
+            if let Some(rest) = s.trim().strip_prefix("html.js ") {
+                found.push(rest.trim().to_string());
+            }
+        }
+    }
+    found
+}
+
+fn js_string_var(js: &str, name: &str) -> Vec<String> {
+    let marker = format!("var {name} = {quote}", quote = '\'');
+    let start = js.find(&marker).unwrap_or_else(|| panic!("app.js missing {name}")) + marker.len();
+    let end = js[start..].find('\'').unwrap() + start;
+    js[start..end].split(',').map(|s| s.trim().to_string()).collect()
+}
+
+#[test]
+fn test_pre_reveal_selectors_are_observed_and_covered_by_failsafe() {
+    use crate::web::static_assets::{APP_JS, STYLE_CSS};
+    let pre = pre_reveal_selectors(STYLE_CSS);
+    assert!(!pre.is_empty(), "expected landing pre-reveal selectors");
+    let observed = js_string_var(APP_JS, "selector");
+    let failsafe = js_string_var(APP_JS, "preReveal");
+
+    // The element whose `revealed` class unlocks each pre-reveal state.
+    let gate = |s: &str| -> String {
+        match s {
+            ".hero-content > *" => ".hero-content",
+            ".feature-card" => ".features-grid",
+            ".step-card" | ".step-number" => ".steps-grid",
+            ".fact-item" => ".band-section",
+            ".floating-badge" => ".hero-card-wrapper",
+            other => other,
+        }
+        .to_string()
+    };
+
+    for s in &pre {
+        assert!(
+            observed.contains(&gate(s)),
+            "pre-reveal selector '{s}' is not observed (gate '{}')",
+            gate(s)
+        );
+        assert!(failsafe.contains(s), "pre-reveal selector '{s}' missing from failsafe list");
+    }
+    assert!(APP_JS.contains("setTimeout(revealAll, 1500)"));
+    assert!(APP_JS.contains("'pageshow'"));
+    assert!(APP_JS.contains("!('IntersectionObserver' in window)"));
+}
+
+#[test]
+fn test_app_page_selectors_have_no_js_pre_reveal() {
+    use crate::web::static_assets::STYLE_CSS;
+    let app_selectors = [
+        ".checkout-card",
+        ".privacy-panel",
+        ".table-container",
+        ".totals-grid",
+        ".scanner-stat",
+        ".scanner-grid",
+        ".site-footer",
+    ];
+    let pre = pre_reveal_selectors(STYLE_CSS);
+    for sel in app_selectors {
+        assert!(
+            !pre.iter().any(|p| p.split_whitespace().any(|t| t == sel)),
+            "app selector {sel} must not have an html.js opacity:0 state"
+        );
+    }
+    // CSS-only load animation exists for app selectors and is disabled under reduced motion.
+    let css = strip_css_comments(STYLE_CSS);
+    assert!(css.contains("animation: app-in 300ms"));
+    assert!(css.contains("@keyframes app-in"));
+    let reduced = css.split("@media (prefers-reduced-motion: reduce)").last().unwrap();
+    assert!(reduced.contains("animation: none !important"));
+}
+
+#[test]
+fn test_app_pages_do_not_depend_on_revealed_class() {
+    let store = open_store(":memory:").expect("open store");
+    let network = Network::TestNetwork;
+    let uivk = test_uivk(&network);
+    let inv = create_invoice(&store, &uivk, &network, 250_000_000, 3600).unwrap();
+    let csrf = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    let pages = vec![
+        (
+            "pay",
+            templates::render_pay_page(
+                &inv, "<svg></svg>", "Awaiting payment", "status-awaiting", "Waiting",
+                0, "zcash:test", None, false, false,
+            ),
+        ),
+        ("demo", templates::render_demo_page(csrf, None, None, false, None)),
+        ("privacy", templates::render_privacy_page(None, false)),
+        ("login", templates::render_login_page(csrf, None, None)),
+        (
+            "dashboard",
+            templates::render_merchant_dashboard(&[], csrf, None, None, None, None),
+        ),
+    ];
+    for (name, html) in &pages {
+        let any_reveal_class = html
+            .split("class=\"")
+            .skip(1)
+            .filter_map(|c| c.split('"').next())
+            .any(|c| c.split_whitespace().any(|t| t.starts_with("reveal")));
+        assert!(!any_reveal_class, "page '{name}' uses a reveal class");
+    }
+    // The landing page, in contrast, uses the marketing reveal on its footer.
+    assert!(templates::render_landing_page(None, false).contains("site-footer reveal"));
+}
+
+#[test]
+fn test_asset_urls_are_versioned_by_content() {
+    use crate::web::static_assets::{content_version, static_url, APP_JS, STYLE_CSS};
+    let landing = templates::render_landing_page(None, false);
+    let css_url = format!("/static/style.css?v={}", content_version(STYLE_CSS.as_bytes()));
+    let js_url = format!("/static/app.js?v={}", content_version(APP_JS.as_bytes()));
+    assert_eq!(static_url("style.css"), css_url);
+    assert_eq!(static_url("app.js"), js_url);
+    assert!(landing.contains(&format!("href=\"{css_url}\"")));
+    assert!(landing.contains(&format!("src=\"{js_url}\"")));
+    assert!(landing.contains("/static/logo-light.png?v="));
+    assert!(landing.contains("/static/shield-mark.png?v="));
+    assert!(landing.contains("/favicon.png?v="));
+    assert!(!landing.contains("\"/static/style.css\""));
+
+    // The version changes whenever the content changes, and is stable otherwise.
+    let a = content_version(b"body { color: red; }");
+    let b = content_version(b"body { color: blue; }");
+    assert_ne!(a, b);
+    assert_eq!(a, content_version(b"body { color: red; }"));
+    assert_eq!(a.len(), 8);
+}
+
+#[tokio::test]
+async fn test_cache_headers_for_assets_and_html() {
+    use crate::web::static_assets::static_url;
+    let (app, _store, _pid, _pw) = setup_test_app(true);
+
+    let get = |uri: String| {
+        let app = app.clone();
+        async move {
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            app.oneshot(req).await.unwrap()
+        }
+    };
+
+    let versioned = get(static_url("style.css")).await;
+    assert_eq!(versioned.status(), StatusCode::OK);
+    assert_eq!(
+        versioned.headers().get("cache-control").unwrap(),
+        "public, max-age=86400, immutable"
+    );
+    let unversioned = get("/static/style.css".to_string()).await;
+    assert_eq!(unversioned.headers().get("cache-control").unwrap(), "no-cache");
+    let stale = get("/static/app.js?v=00000000".to_string()).await;
+    assert_eq!(stale.headers().get("cache-control").unwrap(), "no-cache");
+
+    for path in ["/", "/privacy"] {
+        let res = get(path.to_string()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers().get("cache-control").unwrap(), "no-cache", "{path}");
+    }
+    let demo = get("/demo".to_string()).await;
+    let cc = demo.headers().get("cache-control").unwrap().to_str().unwrap().to_string();
+    assert!(cc == "no-cache" || cc == "no-store", "demo must not be cached");
+}

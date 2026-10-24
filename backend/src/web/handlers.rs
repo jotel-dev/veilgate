@@ -302,6 +302,17 @@ pub async fn pay_handler(
     };
 
     let has_session = has_valid_session(&headers, &state.session_manager);
+    let cursor = state.store.get_last_scanned_height().ok().flatten();
+    let chain_tip = state.store.get_chain_tip().ok().flatten();
+    let is_far_behind = match (cursor, chain_tip) {
+        (Some(c), Some(t)) => t.saturating_sub(c) >= 10,
+        _ => false,
+    };
+    let is_re_reading = inv.is_showcase
+        && is_far_behind
+        && matches!(payment_state, InvoicePaymentState::NoPayment)
+        && inv.status != crate::invoices::InvoiceStatus::Expired;
+
     let html = render_pay_page(
         &inv,
         &qr_svg,
@@ -312,6 +323,7 @@ pub async fn pay_handler(
         &zip321,
         state.repo_url.as_deref(),
         has_session,
+        is_re_reading,
     );
 
     Html(html).into_response()
@@ -770,7 +782,14 @@ pub async fn demo_get(
     };
 
     let has_session = has_valid_session(&headers, &state.session_manager);
-    let html = render_demo_page(&csrf_token, None, state.repo_url.as_deref(), has_session);
+    let showcase = state.store.get_showcase_invoice().ok().flatten();
+    let html = render_demo_page(
+        &csrf_token,
+        None,
+        state.repo_url.as_deref(),
+        has_session,
+        showcase.as_ref(),
+    );
     let mut resp = Html(html).into_response();
     if let Some(c) = set_cookie_opt {
         resp.headers_mut().insert(SET_COOKIE, c);
@@ -830,12 +849,13 @@ pub async fn demo_post(
     }
 
     let valid_csrf = cookie_csrf.unwrap();
+    let showcase = state.store.get_showcase_invoice().ok().flatten();
 
     // Cap pending demo invoices at 100 (counts ONLY demo invoices)
     let invoices = state.store.list_invoices().unwrap_or_default();
     let pending_demo_count = invoices
         .iter()
-        .filter(|i| i.is_demo && i.status == crate::invoices::InvoiceStatus::Pending)
+        .filter(|i| i.is_demo && !i.is_showcase && i.status == crate::invoices::InvoiceStatus::Pending)
         .count();
 
     if pending_demo_count >= 100 {
@@ -844,6 +864,7 @@ pub async fn demo_post(
             Some("Maximum pending demo invoices reached (100). Please wait or pay existing invoices."),
             state.repo_url.as_deref(),
             has_session,
+            showcase.as_ref(),
         );
         return (StatusCode::TOO_MANY_REQUESTS, Html(html)).into_response();
     }
@@ -857,6 +878,7 @@ pub async fn demo_post(
                 Some("Invalid demo amount. Please enter an amount between 0.001 and 10 ZEC."),
                 state.repo_url.as_deref(),
                 has_session,
+                showcase.as_ref(),
             );
             return (StatusCode::BAD_REQUEST, Html(html)).into_response();
         }
@@ -870,6 +892,7 @@ pub async fn demo_post(
             Some("Demo amount must be between 0.001 and 10 ZEC."),
             state.repo_url.as_deref(),
             has_session,
+            showcase.as_ref(),
         );
         return (StatusCode::BAD_REQUEST, Html(html)).into_response();
     }
@@ -881,6 +904,7 @@ pub async fn demo_post(
             Some("Demo invoice validity must be between 1 and 60 minutes."),
             state.repo_url.as_deref(),
             has_session,
+            showcase.as_ref(),
         );
         return (StatusCode::BAD_REQUEST, Html(html)).into_response();
     }
@@ -903,6 +927,7 @@ pub async fn demo_post(
                 Some("Could not create the invoice. Please try again."),
                 state.repo_url.as_deref(),
                 has_session,
+                showcase.as_ref(),
             );
             (StatusCode::INTERNAL_SERVER_ERROR, Html(html)).into_response()
         }

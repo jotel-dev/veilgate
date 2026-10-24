@@ -30,8 +30,16 @@
     --status-underpaid-text: #b91c1c;
     --status-expired-bg: #f1f5f9;
     --status-expired-text: #64748b;
-    --link-color: #0369a1;
     --hero-glow: radial-gradient(circle at 50% 50%, rgba(0, 210, 106, 0.12) 0%, rgba(0, 180, 216, 0.05) 50%, transparent 70%);
+
+    /* Motion system tokens */
+    --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+    --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+    --duration-micro: 180ms;
+    --duration-btn: 220ms;
+    --duration-reveal: 600ms;
+    --duration-float: 6s;
+    --duration-theme: 200ms;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -901,6 +909,11 @@ main {
     color: var(--status-expired-text);
 }
 
+.status-showcase {
+    background-color: var(--status-detected-bg);
+    color: var(--status-detected-text);
+}
+
 .qr-box {
     display: flex;
     justify-content: center;
@@ -1208,4 +1221,250 @@ tr:last-child td {
     color: var(--text-muted);
 }
 
+/* =========================================================================
+   Motion & Polish System
+   Pre-reveal states are landing-only and scoped under html.js.
+   ========================================================================= */
 
+@media (prefers-reduced-motion: no-preference) {
+    @view-transition { navigation: auto; }
+    ::view-transition-old(root) { animation: 180ms var(--ease-out) both vt-fade-out; }
+    ::view-transition-new(root) { animation: 180ms var(--ease-out) both vt-fade-in; }
+}
+@keyframes vt-fade-out { from { opacity: 1; } to { opacity: 0; } }
+@keyframes vt-fade-in { from { opacity: 0; } to { opacity: 1; } }
+
+/* 1. Header Motion & Elevation */
+.site-header {
+    animation: header-entrance var(--duration-reveal) var(--ease-out) both;
+    transition: box-shadow var(--duration-btn) var(--ease-in-out), background-color var(--duration-theme) var(--ease-in-out), border-color var(--duration-theme) var(--ease-in-out);
+}
+@keyframes header-entrance {
+    from { opacity: 0; transform: translateY(-8px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+.site-header.header-scrolled { box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08); }
+[data-theme="dark"] .site-header.header-scrolled { box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4); }
+
+.nav-links a {
+    position: relative;
+    transition: color var(--duration-micro) var(--ease-in-out);
+}
+.nav-links a::after {
+    content: "";
+    position: absolute;
+    bottom: -4px;
+    left: 0;
+    width: 100%;
+    height: 2px;
+    background: var(--accent-green);
+    border-radius: 2px;
+    transform: scaleX(0);
+    transform-origin: right;
+    transition: transform var(--duration-micro) var(--ease-out);
+}
+.nav-links a:hover::after { transform: scaleX(1); transform-origin: left; }
+
+/* Micro-Interactions: Buttons & Inputs */
+.btn-primary {
+    transition: transform var(--duration-btn) var(--ease-in-out), box-shadow var(--duration-btn) var(--ease-in-out), background-position var(--duration-btn) var(--ease-in-out);
+    background-size: 150% 150%;
+}
+.btn-primary:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 16px rgba(0, 210, 106, 0.4);
+    background-position: right center;
+}
+.btn-primary:active, .btn-secondary:active, .btn-icon:active, .mockup-btn:active { transform: scale(0.98); }
+.btn-secondary, .btn-icon {
+    transition: background-color var(--duration-micro) var(--ease-in-out), border-color var(--duration-micro) var(--ease-in-out), color var(--duration-micro) var(--ease-in-out), transform var(--duration-micro) var(--ease-in-out);
+}
+.btn-secondary:hover, .btn-icon:hover { transform: translateY(-1px); }
+
+/* Theme Transition */
+html.theme-ready, html.theme-ready * {
+    transition: background-color var(--duration-theme) var(--ease-in-out), border-color var(--duration-theme) var(--ease-in-out), color var(--duration-theme) var(--ease-in-out);
+}
+
+/* Stagger Utilities */
+.reveal-delay-1 { transition-delay: 70ms; }
+.reveal-delay-2 { transition-delay: 140ms; }
+.reveal-delay-3 { transition-delay: 210ms; }
+.reveal-delay-4 { transition-delay: 280ms; }
+.reveal-delay-5 { transition-delay: 350ms; }
+
+/* App pages: CSS-only load animation, cannot get stuck without JS */
+.checkout-card, .privacy-panel, .table-container, .totals-grid, .scanner-stat, .scanner-grid {
+    animation: app-in 300ms var(--ease-out) both;
+}
+@keyframes app-in {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: none; }
+}
+
+/* Pre-reveal states (landing only), under html.js */
+html.js .hero-content > *,
+html.js .feature-card,
+html.js .band-section,
+html.js .step-card,
+html.js .cta-card,
+html.js .reveal {
+    opacity: 0;
+    transform: translateY(12px);
+    transition: opacity var(--duration-reveal) var(--ease-out), transform var(--duration-reveal) var(--ease-out);
+}
+html.js .hero-card-wrapper {
+    opacity: 0;
+    transform: translateX(20px);
+    transition: opacity var(--duration-reveal) var(--ease-out), transform var(--duration-reveal) var(--ease-out);
+    transition-delay: 160ms;
+}
+html.js .fact-item {
+    opacity: 0;
+    transform: translateX(-10px);
+    transition: opacity var(--duration-reveal) var(--ease-out), transform var(--duration-reveal) var(--ease-out);
+}
+html.js .floating-badge, html.js .step-number {
+    opacity: 0;
+    transform: scale(0.85);
+    transition: opacity var(--duration-btn) var(--ease-out), transform var(--duration-btn) var(--ease-out);
+}
+
+/* Revealed States */
+html.js .revealed,
+html.js .revealed > *,
+html.js .features-grid.revealed .feature-card,
+html.js .band-section.revealed .fact-item,
+html.js .steps-grid.revealed .step-card,
+html.js .steps-grid.revealed .step-number {
+    opacity: 1;
+    transform: none;
+}
+
+/* 2. Hero Stagger */
+html.js .hero-content > .eyebrow { transition-delay: 0ms; }
+html.js .hero-content > h1 { transition-delay: 80ms; }
+html.js .hero-content > .hero-subtext { transition-delay: 160ms; }
+html.js .hero-content > .hero-actions { transition-delay: 240ms; }
+html.js .hero-content > .check-row { transition-delay: 320ms; }
+
+/* 3. Hero Example Card & Floating Badge */
+html.js .floating-badge { transition-delay: 400ms; }
+html.js .hero-card-wrapper.revealed .floating-badge {
+    opacity: 1;
+    transform: none;
+    animation: float-badge var(--duration-float) ease-in-out infinite 1s;
+}
+@keyframes float-badge {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-4px); }
+}
+.mockup-card {
+    transition: transform var(--duration-btn) var(--ease-in-out), box-shadow var(--duration-btn) var(--ease-in-out);
+}
+.mockup-card:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 16px 36px -10px rgba(0, 0, 0, 0.12);
+}
+
+/* 4. Feature Cards */
+html.js .features-grid.revealed .feature-card:nth-child(1) { transition-delay: 0ms; }
+html.js .features-grid.revealed .feature-card:nth-child(2) { transition-delay: 90ms; }
+html.js .features-grid.revealed .feature-card:nth-child(3) { transition-delay: 180ms; }
+html.js .features-grid.revealed .feature-card:nth-child(4) { transition-delay: 270ms; }
+.feature-card {
+    transition: transform var(--duration-btn) var(--ease-in-out), box-shadow var(--duration-btn) var(--ease-in-out), border-color var(--duration-btn) var(--ease-in-out);
+}
+.feature-card:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 14px 28px -8px rgba(0, 0, 0, 0.1);
+    border-color: rgba(0, 210, 106, 0.35);
+}
+.feature-icon-wrapper svg { transition: transform var(--duration-micro) var(--ease-out); }
+.feature-card:hover .feature-icon-wrapper svg { transform: scale(1.12); }
+
+/* 5. Built for Privacy Band */
+html.js .band-section.revealed .fact-item:nth-child(1) { transition-delay: 80ms; }
+html.js .band-section.revealed .fact-item:nth-child(2) { transition-delay: 160ms; }
+html.js .band-section.revealed .fact-item:nth-child(3) { transition-delay: 240ms; }
+
+/* 6. How It Works Steps */
+html.js .steps-grid.revealed .step-card:nth-child(1) { transition-delay: 0ms; }
+html.js .steps-grid.revealed .step-card:nth-child(2) { transition-delay: 90ms; }
+html.js .steps-grid.revealed .step-card:nth-child(3) { transition-delay: 180ms; }
+html.js .steps-grid.revealed .step-card:nth-child(1) .step-number { transition-delay: 80ms; }
+html.js .steps-grid.revealed .step-card:nth-child(2) .step-number { transition-delay: 170ms; }
+html.js .steps-grid.revealed .step-card:nth-child(3) .step-number { transition-delay: 260ms; }
+.step-card {
+    transition: transform var(--duration-btn) var(--ease-in-out), box-shadow var(--duration-btn) var(--ease-in-out);
+}
+.step-card:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 12px 24px -6px rgba(0, 0, 0, 0.08);
+}
+@media (min-width: 768px) {
+    .step-card:not(:last-child)::after {
+        content: "";
+        position: absolute;
+        top: 50%;
+        right: -1.25rem;
+        width: 0.5rem;
+        height: 0.5rem;
+        border-top: 2px solid var(--accent-green);
+        border-right: 2px solid var(--accent-green);
+        transform: translateY(-50%) rotate(45deg);
+        opacity: 0.6;
+    }
+}
+
+/* 7. Final Banner */
+.cta-card {
+    background: linear-gradient(135deg, var(--bg-surface) 0%, var(--bg-mint) 50%, var(--bg-surface) 100%);
+    background-size: 200% 200%;
+    animation: bg-drift 10s ease-in-out infinite;
+}
+@keyframes bg-drift {
+    0%, 100% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+}
+.cta-shield img { animation: float-shield var(--duration-float) ease-in-out infinite; }
+@keyframes float-shield {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-5px); }
+}
+
+/* 8. Footer Reveal & Links */
+.footer-links a {
+    display: inline-block;
+    transition: color var(--duration-micro) ease, transform var(--duration-micro) ease;
+}
+.footer-links a:hover { color: var(--text-primary); transform: translateY(-1px); }
+
+/* 10. App Pages (Pay, Demo, Privacy, Login, Dashboard) */
+.form-input {
+    transition: border-color var(--duration-micro) ease, box-shadow var(--duration-micro) ease;
+}
+.form-input:focus {
+    border-color: var(--accent-green);
+    box-shadow: var(--focus-ring);
+}
+.status-pill {
+    transition: background-color 200ms var(--ease-in-out), color 200ms var(--ease-in-out), opacity 200ms var(--ease-in-out);
+}
+
+/* Prefers Reduced Motion Guard */
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
+    html.js * {
+        opacity: 1 !important;
+        transform: none !important;
+        animation: none !important;
+        transition: opacity 150ms ease !important;
+        transition-delay: 0ms !important;
+    }
+}

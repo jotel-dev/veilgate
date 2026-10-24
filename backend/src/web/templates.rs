@@ -120,7 +120,7 @@ impl From<Invoice> for DashboardInvoiceItem {
     }
 }
 
-/// Base HTML layout wrapper.
+/// Base HTML layout wrapper for app pages (no JS-dependent reveal states).
 pub fn layout(
     title: &str,
     content: &str,
@@ -130,6 +130,38 @@ pub fn layout(
     meta_refresh_seconds: Option<u32>,
     has_session: bool,
 ) -> String {
+    layout_with(
+        title,
+        content,
+        show_testnet_banner,
+        repo_url,
+        csrf_token,
+        meta_refresh_seconds,
+        has_session,
+        false,
+    )
+}
+
+/// Layout wrapper; `landing` enables the scroll-reveal footer (marketing page only).
+#[allow(clippy::too_many_arguments)]
+fn layout_with(
+    title: &str,
+    content: &str,
+    show_testnet_banner: bool,
+    repo_url: Option<&str>,
+    csrf_token: Option<&str>,
+    meta_refresh_seconds: Option<u32>,
+    has_session: bool,
+    landing: bool,
+) -> String {
+    use super::static_assets::static_url;
+    let css_url = static_url("style.css");
+    let js_url = static_url("app.js");
+    let favicon_url = static_url("favicon.png");
+    let touch_url = static_url("apple-touch-icon.png");
+    let logo_light_url = static_url("logo-light.png");
+    let logo_dark_url = static_url("logo-dark.png");
+    let footer_class = if landing { "site-footer reveal" } else { "site-footer" };
     let title_esc = esc(title);
     let testnet_bar = if show_testnet_banner {
         r#"<div class="testnet-banner" role="alert">Testnet Only &mdash; No real funds &mdash; Zcash Testnet coins only</div>"#
@@ -175,18 +207,18 @@ pub fn layout(
     <title>{title_esc} &mdash; VeilGate</title>
     <meta name="description" content="VeilGate is a privacy-first shielded payment checkout for Zcash testnet.">
     {refresh_tag}
-    <link rel="stylesheet" href="/static/style.css">
-    <link rel="icon" type="image/png" sizes="32x32" href="/favicon.png">
-    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
-    <script src="/static/app.js" defer></script>
+    <link rel="stylesheet" href="{css_url}">
+    <link rel="icon" type="image/png" sizes="32x32" href="{favicon_url}">
+    <link rel="apple-touch-icon" sizes="180x180" href="{touch_url}">
+    <script src="{js_url}" defer></script>
 </head>
 <body>
     {testnet_bar}
     <header class="site-header">
         <div class="header-inner">
             <a href="/" class="logo-container" aria-label="VeilGate Home">
-                <img src="/static/logo-light.png" class="logo-light" alt="VeilGate" width="130" height="38">
-                <img src="/static/logo-dark.png" class="logo-dark" alt="VeilGate" width="130" height="38">
+                <img src="{logo_light_url}" class="logo-light" alt="VeilGate" width="130" height="38">
+                <img src="{logo_dark_url}" class="logo-dark" alt="VeilGate" width="130" height="38">
             </a>
             <nav class="nav-links" aria-label="Main Navigation">
                 <a href="/">Home</a>
@@ -206,12 +238,12 @@ pub fn layout(
     <main>
         {content}
     </main>
-    <footer class="site-footer">
+    <footer class="{footer_class}">
         <div class="footer-inner">
             <div class="footer-brand">
                 <a href="/" class="logo-container" aria-label="VeilGate Home">
-                    <img src="/static/logo-light.png" class="logo-light" alt="VeilGate" width="110" height="32">
-                    <img src="/static/logo-dark.png" class="logo-dark" alt="VeilGate" width="110" height="32">
+                    <img src="{logo_light_url}" class="logo-light" alt="VeilGate" width="110" height="32">
+                    <img src="{logo_dark_url}" class="logo-dark" alt="VeilGate" width="110" height="32">
                 </a>
             </div>
             <div class="footer-links">
@@ -240,10 +272,11 @@ pub fn layout(
 /// - Exact text strings
 /// - None of the banned words
 pub fn render_landing_page(repo_url: Option<&str>, has_session: bool) -> String {
+    let shield_url = super::static_assets::static_url("shield-mark.png");
     let content = format!(
         r#"<section class="hero-section">
     <div class="hero-grid">
-        <div class="hero-content">
+        <div class="hero-content reveal-on-load">
             <span class="eyebrow">PRIVACY-FIRST PAYMENTS</span>
             <h1>Secure checkout. Private by design.</h1>
             <p class="hero-subtext">VeilGate is a shielded payment checkout for merchants. Create an invoice, share a link or QR code, and confirm payment with a watch-only key that cannot spend your funds.</p>
@@ -257,7 +290,7 @@ pub fn render_landing_page(repo_url: Option<&str>, has_session: bool) -> String 
                 <div class="check-item">{check_icon} <span>No trackers</span></div>
             </div>
         </div>
-        <div class="hero-card-wrapper">
+        <div class="hero-card-wrapper reveal-on-load">
             <div class="floating-badge">
                 {lock_icon} <span>No account. No tracking.</span>
             </div>
@@ -284,7 +317,7 @@ pub fn render_landing_page(repo_url: Option<&str>, has_session: bool) -> String 
 </section>
 
 <section class="features-section">
-    <div class="features-grid">
+    <div class="features-grid reveal">
         <div class="feature-card">
             <div class="feature-icon-wrapper">{shield_icon}</div>
             <h3>Shielded payments</h3>
@@ -308,7 +341,7 @@ pub fn render_landing_page(repo_url: Option<&str>, has_session: bool) -> String 
     </div>
 </section>
 
-<section class="band-section">
+<section class="band-section reveal">
     <div class="band-inner">
         <div class="band-content">
             <span class="eyebrow">BUILT FOR PRIVACY</span>
@@ -324,11 +357,11 @@ pub fn render_landing_page(repo_url: Option<&str>, has_session: bool) -> String 
 </section>
 
 <section class="how-section" id="how-it-works">
-    <div class="section-header">
+    <div class="section-header reveal">
         <span class="eyebrow">HOW IT WORKS</span>
         <h2>Three steps to private checkout</h2>
     </div>
-    <div class="steps-grid">
+    <div class="steps-grid reveal">
         <div class="step-card">
             <div class="step-number">1</div>
             <h3>Create an invoice</h3>
@@ -348,14 +381,14 @@ pub fn render_landing_page(repo_url: Option<&str>, has_session: bool) -> String 
 </section>
 
 <section class="cta-section">
-    <div class="cta-card">
+    <div class="cta-card reveal">
         <div class="cta-text">
             <h2>Ready to see it work?</h2>
             <p>Create a testnet invoice and pay it with a Zcash testnet wallet.</p>
             <a href="/demo" class="btn-primary" id="cta-demo-btn">Try the demo</a>
         </div>
         <div class="cta-shield">
-            <img src="/static/shield-mark.png" alt="VeilGate Shield Mark" width="120" height="120">
+            <img src="{shield_url}" alt="VeilGate Shield Mark" width="120" height="120">
         </div>
     </div>
 </section>"#,
@@ -367,7 +400,7 @@ pub fn render_landing_page(repo_url: Option<&str>, has_session: bool) -> String 
         qr_icon = icons::QR_CODE,
     );
 
-    layout("Privacy-First Zcash Merchant Checkout", &content, false, repo_url, None, None, has_session)
+    layout_with("Privacy-First Zcash Merchant Checkout", &content, false, repo_url, None, None, has_session, true)
 }
 
 /// Renders Customer Payment Page (`GET /pay/{public_id}`).
@@ -381,6 +414,7 @@ pub fn render_pay_page<'a>(
     zip321_uri: &str,
     repo_url: Option<&str>,
     has_session: bool,
+    is_re_reading: bool,
 ) -> String {
     let status_label = status_label.into();
     let status_label_esc = esc(&status_label);
@@ -420,6 +454,12 @@ pub fn render_pay_page<'a>(
         ""
     };
 
+    let re_read_html = if is_re_reading {
+        r#"<p class="form-help" id="showcase-re-read-notice">This example is being re-read from the chain after a restart</p>"#
+    } else {
+        ""
+    };
+
     let content = format!(
         r#"<div class="container">
     <div class="checkout-card" id="pay-container" data-public-id="{public_id}">
@@ -429,6 +469,7 @@ pub fn render_pay_page<'a>(
         </div>
         <h1 class="mockup-title">Complete your payment</h1>
         <p class="form-help" id="pay-status-desc">{status_desc}</p>
+        {re_read_html}
 
         <div class="mockup-amount-box">
             <div class="form-help">Amount requested</div>
@@ -469,7 +510,7 @@ pub fn render_pay_page<'a>(
             <h4>Privacy Model &mdash; This Checkout</h4>
             <ul>
                 <li><strong>What this page does NOT do:</strong> 0 third-party trackers, 0 external web fonts, 0 remote scripts, 0 analytics. Does not record your IP or store customer identities.</li>
-                <li><strong>What the merchant sees:</strong> That this invoice was visited, the payment amount and confirmation count once mined into a block, and any memo included by your wallet.</li>
+                <li><strong>What the merchant sees:</strong> That this invoice was visited, and the payment amount and confirmation count once mined into a block. VeilGate's scanner reads compact blocks, which do not carry memos, so VeilGate neither reads nor stores memos. A holder of the viewing key could read memos by downloading full transactions. Fauzec's page states its payments carry a default receipt memo; VeilGate does not read it.</li>
                 <li><strong>Network privacy:</strong> The merchant server sees HTTP connections to this invoice URL. Use Tor or a trusted VPN if you need network-level IP privacy against the host.</li>
                 <li><strong>Pools &amp; receivers:</strong> The invoice address has an Orchard receiver; on the current network payments to it are recorded in the Ironwood pool.</li>
             </ul>
@@ -515,7 +556,7 @@ pub fn render_privacy_page(repo_url: Option<&str>, has_session: bool) -> String 
 
         <div class="privacy-panel">
             <h4>What the merchant server sees</h4>
-            <p>The merchant server sees the amount and arrival time (block timestamp) of each payment, and any memo the customer's wallet includes (VeilGate does not request a memo). The server holds an incoming viewing key: it can detect payments but cannot spend them. VeilGate stores no customer names, emails, IPs, or cookies.</p>
+            <p>The merchant server sees the amount and arrival time (block timestamp) of each payment. VeilGate's scanner reads compact blocks, which do not carry memos, so VeilGate neither reads nor stores memos. A holder of the viewing key could read memos by downloading full transactions. Fauzec's page states its payments carry a default receipt memo; VeilGate does not read it. The server holds an incoming viewing key: it can detect payments but cannot spend them. VeilGate stores no customer names, emails, IPs, or cookies.</p>
         </div>
 
         <div class="privacy-panel">
@@ -551,7 +592,13 @@ pub fn render_privacy_page(repo_url: Option<&str>, has_session: bool) -> String 
 }
 
 /// Renders the Demo Page (`GET /demo`).
-pub fn render_demo_page(csrf_token: &str, error_msg: Option<&str>, repo_url: Option<&str>, has_session: bool) -> String {
+pub fn render_demo_page(
+    csrf_token: &str,
+    error_msg: Option<&str>,
+    repo_url: Option<&str>,
+    has_session: bool,
+    showcase_invoice: Option<&Invoice>,
+) -> String {
     let error_html = if let Some(err) = error_msg {
         format!(r#"<div class="form-error" role="alert">{}</div>"#, esc(err))
     } else {
@@ -559,8 +606,26 @@ pub fn render_demo_page(csrf_token: &str, error_msg: Option<&str>, repo_url: Opt
     };
     let csrf_token_esc = esc(csrf_token);
 
+    let showcase_html = if let Some(showcase) = showcase_invoice {
+        let label_text = showcase.label.as_deref().unwrap_or("Real faucet payment demonstration");
+        format!(
+            r#"<div class="checkout-card mb-4" id="showcase-card">
+        <span class="eyebrow">SHOWCASE EXAMPLE</span>
+        <h2>See a real completed payment</h2>
+        <p class="hero-subtext">{}</p>
+        <p class="form-help">This invoice was paid on the Zcash testnet with a faucet payment; this server detected it with its watch-only key.</p>
+        <a href="/pay/{}" class="btn-primary" id="showcase-pay-link">See a real completed payment</a>
+    </div>"#,
+            esc(label_text),
+            esc(&showcase.public_id),
+        )
+    } else {
+        String::new()
+    };
+
     let content = format!(
         r#"<div class="container">
+    {showcase_html}
     <div class="checkout-card">
         <span class="eyebrow">TESTNET DEMO</span>
         <h1>Create a Testnet Invoice</h1>
@@ -571,16 +636,17 @@ pub fn render_demo_page(csrf_token: &str, error_msg: Option<&str>, repo_url: Opt
             <input type="hidden" name="csrf_token" value="{csrf_token}">
             <div class="form-group">
                 <label class="form-label" for="demo-amount">Amount (ZEC)</label>
-                <input class="form-input" type="text" id="demo-amount" name="amount" value="0.1" placeholder="0.1" required>
+                <input class="form-input" type="text" id="demo-amount" name="amount" value="0.01" placeholder="0.01" required>
                 <div class="form-help">Allowed range: 0.001 to 10 ZEC (testnet)</div>
             </div>
             <div class="form-group">
                 <label class="form-label" for="demo-validity">Validity (minutes)</label>
-                <input class="form-input" type="number" id="demo-validity" name="validity_minutes" value="15" min="1" max="60" required>
+                <input class="form-input" type="number" id="demo-validity" name="validity_minutes" value="60" min="1" max="60" required>
                 <div class="form-help">Maximum validity: 60 minutes</div>
             </div>
             <button type="submit" class="btn-primary" id="demo-submit-btn">Create Testnet Invoice</button>
         </form>
+        <p class="form-help">Testnet faucets pay between 0.1 and 1 test coin; a 0.01 invoice is covered by any of them.</p>
 
         <details class="faucet-help" id="how-to-pay-section">
             <summary>How to pay on testnet</summary>
@@ -595,6 +661,7 @@ pub fn render_demo_page(csrf_token: &str, error_msg: Option<&str>, repo_url: Opt
         </details>
     </div>
 </div>"#,
+        showcase_html = showcase_html,
         error_html = error_html,
         csrf_token = csrf_token_esc,
     );
@@ -747,7 +814,9 @@ pub fn render_merchant_dashboard(
             esc(state_name)
         );
 
-        let type_badge = if inv.is_demo {
+        let type_badge = if inv.is_showcase {
+            r#"<span class="status-pill status-showcase">Showcase</span>"#
+        } else if inv.is_demo {
             r#"<span class="status-pill status-demo">Demo</span>"#
         } else {
             r#"<span class="status-pill status-merchant">Merchant</span>"#

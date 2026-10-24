@@ -641,8 +641,8 @@ pub struct ScanPassSummary {
 }
 
 /// Scans a single bounded block range (chunk), checks for reorgs, applies detected notes,
-/// and updates the scan cursor and success timestamp to `chunk_end`.
-pub async fn scan_single_chunk(
+/// and optionally updates the scan cursor. Always updates the last success timestamp.
+pub async fn scan_single_chunk_internal(
     client: &mut CompactTxStreamerClient<Channel>,
     store: &Store,
     network: &Network,
@@ -653,6 +653,7 @@ pub async fn scan_single_chunk(
     chunk_start: u64,
     chunk_end: u64,
     tip: u64,
+    update_cursor: bool,
 ) -> Result<(u64, usize, usize), ScanError> {
     let range = BlockRange {
         start: Some(BlockId {
@@ -711,10 +712,12 @@ pub async fn scan_single_chunk(
     let result = apply_detected(store, &detected_notes, tip, confirmations)
         .map_err(ScanError::database)?;
 
-    // Update scan cursor in invoice_meta to the end of THAT chunk
-    store
-        .set_last_scanned_height(chunk_end)
-        .map_err(ScanError::database)?;
+    // Update scan cursor in invoice_meta to the end of THAT chunk if requested
+    if update_cursor {
+        store
+            .set_last_scanned_height(chunk_end)
+            .map_err(ScanError::database)?;
+    }
 
     // Record last successful scan time in invoice_meta
     let now = SystemTime::now()
@@ -726,6 +729,172 @@ pub async fn scan_single_chunk(
         .map_err(ScanError::database)?;
 
     Ok((blocks_scanned, result.payments_detected, result.invoices_paid))
+}
+
+/// Scans a single bounded block range (chunk), checks for reorgs, applies detected notes,
+/// and updates the scan cursor and success timestamp to `chunk_end`.
+pub async fn scan_single_chunk(
+    client: &mut CompactTxStreamerClient<Channel>,
+    store: &Store,
+    network: &Network,
+    scanning_keys: &ScanningKeys<u32, u32>,
+    nullifiers: &Nullifiers<u32>,
+    uivk: &UnifiedIncomingViewingKey,
+    confirmations: u32,
+    chunk_start: u64,
+    chunk_end: u64,
+    tip: u64,
+) -> Result<(u64, usize, usize), ScanError> {
+    scan_single_chunk_internal(
+        client,
+        store,
+        network,
+        scanning_keys,
+        nullifiers,
+        uivk,
+        confirmations,
+        chunk_start,
+        chunk_end,
+        tip,
+        true,
+    )
+    .await
+}
+
+/// Pauses between showcase scan attempts: up to 5 retries after the first attempt.
+pub const SHOWCASE_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(10),
+    Duration::from_secs(20),
+    Duration::from_secs(40),
+    Duration::from_secs(80),
+    Duration::from_secs(160),
+];
+
+/// Runs `op` once, then retries after each pause in `delays` while it keeps failing.
+/// `pause` performs the wait (injected so tests need not sleep) and `on_fail` receives the
+/// 1-based attempt number and error of every failed attempt. Returns the last error if all fail.
+pub async fn retry_with_delays<T, E, F, Fut, P, PFut>(
+    delays: &[Duration],
+    mut op: F,
+    mut pause: P,
+    mut on_fail: impl FnMut(usize, &E),
+) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    P: FnMut(Duration) -> PFut,
+    PFut: std::future::Future<Output = ()>,
+{
+    let mut attempt = 1;
+    loop {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                on_fail(attempt, &e);
+                match delays.get(attempt - 1) {
+                    Some(d) => pause(*d).await,
+                    None => return Err(e),
+                }
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// Moves the scan cursor forward only, so a late bounded pass never rewinds a running scanner.
+fn advance_cursor(store: &Store, height: u64) -> Result<()> {
+    if store.get_last_scanned_height()?.map_or(true, |h| h < height) {
+        store.set_last_scanned_height(height)?;
+    }
+    Ok(())
+}
+
+/// Runs ONE bounded scan pass over [scan_from_height, scan_to_height] using chunked scanning
+/// and apply_detected logic (with current chain tip for confirmations), then sets the main cursor
+/// to the normal fresh-database start (tip minus 100).
+pub async fn run_bounded_scan_pass(
+    client: &mut CompactTxStreamerClient<Channel>,
+    store: &Store,
+    network: &Network,
+    scanning_keys: &ScanningKeys<u32, u32>,
+    nullifiers: &Nullifiers<u32>,
+    uivk: &UnifiedIncomingViewingKey,
+    confirmations: u32,
+    scan_from_height: u64,
+    scan_to_height: u64,
+) -> Result<ScanPassSummary, ScanError> {
+    let info = client
+        .get_lightd_info(tonic::Request::new(Empty {}))
+        .await
+        .map_err(ScanError::connect)?
+        .into_inner();
+
+    if info.chain_name != "test" {
+        let err = ScanError::other(anyhow!(
+            "Connected server chain is '{}', but TESTNET ('test') is strictly required",
+            info.chain_name
+        ));
+        let _ = store.set_last_error_category(&err.kind.category());
+        return Err(err);
+    }
+
+    let tip = info.block_height;
+    store.set_chain_tip(tip).map_err(ScanError::database)?;
+
+    if scan_from_height > scan_to_height {
+        let fresh_start = tip.saturating_sub(DEFAULT_LOOKBACK_BLOCKS);
+        advance_cursor(store, fresh_start).map_err(ScanError::database)?;
+        return Ok(ScanPassSummary {
+            blocks_scanned: 0,
+            start_height: scan_from_height,
+            end_height: scan_to_height,
+            payments_detected: 0,
+            invoices_paid: 0,
+        });
+    }
+
+    let chunks = plan_chunks(scan_from_height, scan_to_height, CHUNK_BLOCKS);
+    let mut total_blocks_scanned: u64 = 0;
+    let mut total_payments_detected: usize = 0;
+    let mut total_invoices_paid: usize = 0;
+
+    for (chunk_start, chunk_end) in chunks {
+        let chunk_res = tokio::time::timeout(
+            CHUNK_TIMEOUT,
+            scan_single_chunk_internal(
+                client,
+                store,
+                network,
+                scanning_keys,
+                nullifiers,
+                uivk,
+                confirmations,
+                chunk_start,
+                chunk_end,
+                tip,
+                false, // do not park the cursor inside the bounded range
+            ),
+        )
+        .await
+        .map_err(|_| ScanError::timeout())?;
+
+        let (scanned, payments, paid) = chunk_res?;
+        total_blocks_scanned += scanned;
+        total_payments_detected += payments;
+        total_invoices_paid += paid;
+    }
+
+    // Set the main cursor to the normal fresh-database start (tip minus 100)
+    let fresh_start = tip.saturating_sub(DEFAULT_LOOKBACK_BLOCKS);
+    advance_cursor(store, fresh_start).map_err(ScanError::database)?;
+
+    Ok(ScanPassSummary {
+        blocks_scanned: total_blocks_scanned,
+        start_height: scan_from_height,
+        end_height: scan_to_height,
+        payments_detected: total_payments_detected,
+        invoices_paid: total_invoices_paid,
+    })
 }
 
 /// Executes a scan pass across the lightwalletd compact block stream in chunks of 500 blocks.
@@ -878,6 +1047,69 @@ mod tests {
             .unwrap();
         usk.to_unified_full_viewing_key()
             .to_unified_incoming_viewing_key()
+    }
+
+    #[test]
+    fn test_showcase_retry_delays_are_10_to_160_seconds() {
+        let secs: Vec<u64> = SHOWCASE_RETRY_DELAYS.iter().map(|d| d.as_secs()).collect();
+        assert_eq!(secs, vec![10, 20, 40, 80, 160]);
+    }
+
+    #[tokio::test]
+    async fn test_retry_with_delays_exhausts_schedule_on_permanent_failure() {
+        let attempts = std::cell::Cell::new(0usize);
+        let pauses = std::cell::RefCell::new(Vec::new());
+        let logged = std::cell::RefCell::new(Vec::new());
+        let res: Result<(), &str> = retry_with_delays(
+            &SHOWCASE_RETRY_DELAYS,
+            || {
+                attempts.set(attempts.get() + 1);
+                async { Err("connect") }
+            },
+            |d| {
+                pauses.borrow_mut().push(d.as_secs());
+                async {}
+            },
+            |n, e: &&str| logged.borrow_mut().push((n, e.to_string())),
+        )
+        .await;
+        assert_eq!(res, Err("connect"));
+        assert_eq!(attempts.get(), 6, "first attempt plus 5 retries");
+        assert_eq!(*pauses.borrow(), vec![10, 20, 40, 80, 160]);
+        assert_eq!(logged.borrow().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn test_retry_with_delays_stops_after_success() {
+        let attempts = std::cell::Cell::new(0usize);
+        let pauses = std::cell::RefCell::new(Vec::new());
+        let res: Result<u32, &str> = retry_with_delays(
+            &SHOWCASE_RETRY_DELAYS,
+            || {
+                attempts.set(attempts.get() + 1);
+                let n = attempts.get();
+                async move { if n < 3 { Err("stream") } else { Ok(7) } }
+            },
+            |d| {
+                pauses.borrow_mut().push(d.as_secs());
+                async {}
+            },
+            |_, _| {},
+        )
+        .await;
+        assert_eq!(res, Ok(7));
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(*pauses.borrow(), vec![10, 20]);
+    }
+
+    #[test]
+    fn test_advance_cursor_never_moves_backward() {
+        let store = open_store(":memory:").unwrap();
+        advance_cursor(&store, 500).unwrap();
+        advance_cursor(&store, 300).unwrap();
+        assert_eq!(store.get_last_scanned_height().unwrap(), Some(500));
+        advance_cursor(&store, 600).unwrap();
+        assert_eq!(store.get_last_scanned_height().unwrap(), Some(600));
     }
 
     #[test]
@@ -1567,5 +1799,75 @@ mod tests {
         // 3. Existing database resumes from last_scanned minus reorg depth
         let start_resume = calculate_scan_start_height(Some(2_999_950), current_tip, None);
         assert_eq!(start_resume, 2_999_950 - DEFAULT_REORG_DEPTH);
+    }
+
+    #[test]
+    fn test_showcase_seeding_does_not_move_main_cursor_away_from_tip_minus_100() {
+        let store = crate::invoices::open_store(":memory:").unwrap();
+        let net = Network::TestNetwork;
+        let uivk = test_uivk(&net);
+
+        let cfg = crate::invoices::ShowcaseConfig {
+            index: 5,
+            amount_zatoshi: 1_000_000,
+            public_id: "0123456789abcdef0123456789abcdef".to_string(),
+            scan_from_height: 2_000_000,
+            scan_to_height: 2_000_500,
+            label: "Test showcase".to_string(),
+        };
+
+        let seeded = crate::invoices::init_showcase_invoice(&store, &uivk, &net, &cfg).unwrap();
+        assert!(seeded);
+
+        // After seeding on an empty DB, main cursor in invoice_meta must be None (not parked at scan_from_height)
+        let last_scanned = store.get_last_scanned_height().unwrap();
+        assert_eq!(last_scanned, None);
+
+        // Test planning function calculate_scan_start_height with synthetic tip value
+        let synthetic_tip = 3_500_000;
+        let planned_start = calculate_scan_start_height(last_scanned, synthetic_tip, None);
+
+        // Seeding showcase must not move the main cursor away from tip minus 100
+        assert_eq!(
+            planned_start,
+            synthetic_tip - DEFAULT_LOOKBACK_BLOCKS,
+            "Main cursor start height must remain tip minus 100"
+        );
+        assert_eq!(planned_start, 3_499_900);
+    }
+
+    #[test]
+    fn test_bounded_pass_range_is_from_to_only() {
+        let from_height = 2_500_000;
+        let to_height = 2_501_200;
+
+        let chunks = plan_chunks(from_height, to_height, CHUNK_BLOCKS);
+        assert!(!chunks.is_empty());
+
+        // First chunk starts at exactly from_height
+        assert_eq!(chunks.first().unwrap().0, from_height);
+        // Last chunk ends at exactly to_height
+        assert_eq!(chunks.last().unwrap().1, to_height);
+
+        // Check chunks cover [from_height, to_height] contiguously with no blocks outside [from, to]
+        for i in 0..chunks.len() {
+            let (c_start, c_end) = chunks[i];
+            assert!(c_start >= from_height, "Chunk start {c_start} is below from_height");
+            assert!(c_end <= to_height, "Chunk end {c_end} exceeds to_height");
+            assert!(c_start <= c_end);
+            assert!(c_end - c_start + 1 <= CHUNK_BLOCKS);
+
+            if i + 1 < chunks.len() {
+                assert_eq!(chunks[i + 1].0, c_end + 1, "Gap or overlap between chunks");
+            }
+        }
+
+        // Bounded range when from == to (single block)
+        let single = plan_chunks(3_000_000, 3_000_000, CHUNK_BLOCKS);
+        assert_eq!(single, vec![(3_000_000, 3_000_000)]);
+
+        // Bounded range when from > to is empty
+        let empty = plan_chunks(3_000_001, 3_000_000, CHUNK_BLOCKS);
+        assert!(empty.is_empty());
     }
 }

@@ -18,7 +18,10 @@ use zcash_protocol::consensus::Network;
 
 use veilgate_backend::addresses::resolve_viewing_key;
 use veilgate_backend::invoices::open_store;
-use veilgate_backend::scanner::{build_scanning_keys, run_scan_pass, DEFAULT_CONFIRMATIONS};
+use veilgate_backend::scanner::{
+    build_scanning_keys, retry_with_delays, run_bounded_scan_pass, run_scan_pass,
+    DEFAULT_CONFIRMATIONS, SHOWCASE_RETRY_DELAYS,
+};
 use veilgate_backend::web::auth::SessionManager;
 use veilgate_backend::web::rate_limit::RateLimiter;
 use veilgate_backend::web::{build_app, hash_password, AppState};
@@ -155,6 +158,26 @@ async fn main() -> Result<()> {
             .with_context(|| format!("Failed to open invoice database at {}", db_path.display()))?,
     );
 
+    // Seed showcase invoice if configured and database is brand new and empty
+    let showcase_cfg = if let Ok(showcase_raw) = std::env::var("VEILGATE_SHOWCASE") {
+        veilgate_backend::invoices::parse_showcase_env(&showcase_raw)
+    } else {
+        None
+    };
+
+    let showcase_to_scan = if let Some(ref cfg) = showcase_cfg {
+        match store.init_showcase_invoice(&uivk, &network, cfg) {
+            Ok(true) => Some((cfg.scan_from_height, cfg.scan_to_height)),
+            Ok(false) => None,
+            Err(e) => {
+                eprintln!("Notice: Failed to initialize showcase invoice: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let password_hash = std::env::var("VEILGATE_PASSWORD_HASH").ok();
     if password_hash.is_none() {
         eprintln!("Notice: VEILGATE_PASSWORD_HASH not set. Merchant dashboard login will be disabled until set.");
@@ -204,6 +227,62 @@ async fn main() -> Result<()> {
         }
     });
 
+    // If the showcase invoice was seeded on an empty database, run ONE bounded pass in its own
+    // task so it never holds up the normal scanner loop below. Failed attempts are retried on
+    // a fixed schedule; only a generic error category is logged.
+    if let Some((from_h, to_h)) = showcase_to_scan {
+        let sc_store = Arc::clone(&store);
+        let sc_uivk = uivk.clone();
+        let sc_url = scanner_url.clone();
+        let sc_confs = args.confirmations;
+        tokio::spawn(async move {
+            let Ok(scanning_keys) = build_scanning_keys(&sc_uivk) else {
+                eprintln!("showcase scan could not start");
+                return;
+            };
+            let nullifiers = Nullifiers::empty();
+            let tls = ClientTlsConfig::new().with_webpki_roots();
+            let Some(endpoint) = Endpoint::from_shared(sc_url)
+                .ok()
+                .and_then(|ep| ep.tls_config(tls).ok())
+            else {
+                eprintln!("showcase scan could not start");
+                return;
+            };
+            let result = retry_with_delays(
+                &SHOWCASE_RETRY_DELAYS,
+                || async {
+                    let mut c = CompactTxStreamerClient::connect(endpoint.clone())
+                        .await
+                        .map_err(|_| "connect".to_string())?;
+                    run_bounded_scan_pass(
+                        &mut c,
+                        &sc_store,
+                        &network,
+                        &scanning_keys,
+                        &nullifiers,
+                        &sc_uivk,
+                        sc_confs,
+                        from_h,
+                        to_h,
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.kind.category())
+                },
+                sleep,
+                |attempt, cat: &String| {
+                    eprintln!("showcase scan attempt {attempt} failed ({cat})");
+                },
+            )
+            .await;
+            if result.is_err() {
+                eprintln!("showcase scan failed after all retry attempts; the normal scanner continues");
+            }
+        });
+    }
+
+
     let debug_errors = args.debug_errors;
     tokio::spawn(async move {
         let scanning_keys = match build_scanning_keys(&scanner_uivk) {
@@ -229,6 +308,9 @@ async fn main() -> Result<()> {
                 return;
             }
         };
+
+        // Give the web server a short moment to start listening first
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client: Option<CompactTxStreamerClient<tonic::transport::Channel>> = None;
         let mut backoff = INITIAL_BACKOFF;

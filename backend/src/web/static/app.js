@@ -6,6 +6,9 @@
 (function () {
     'use strict';
 
+    // Mark HTML as JS-enabled to safely activate pre-reveal hidden states
+    document.documentElement.classList.add('js');
+
     // --- Theme Management ---
     function initTheme() {
         var stored = localStorage.getItem('veilgate-theme');
@@ -14,6 +17,9 @@
             theme = (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
         }
         document.documentElement.setAttribute('data-theme', theme);
+        setTimeout(function () {
+            document.documentElement.classList.add('theme-ready');
+        }, 40);
 
         var toggleBtn = document.getElementById('theme-toggle');
         if (toggleBtn) {
@@ -173,9 +179,74 @@
         poller = setInterval(checkStatus, pollInterval);
     }
 
+    // --- Header Scroll Elevation ---
+    function initHeaderScroll() {
+        var header = document.querySelector('.site-header');
+        if (!header) return;
+        function onScroll() {
+            if (window.scrollY > 12) {
+                header.classList.add('header-scrolled');
+            } else {
+                header.classList.remove('header-scrolled');
+            }
+        }
+        window.addEventListener('scroll', onScroll, { passive: true });
+        onScroll();
+    }
+
+    // --- Motion Reveal Observer ---
+    function initReveals() {
+        // Landing-page marketing sections only; app pages never use JS reveals.
+        var selector = '.reveal, .reveal-on-load, .hero-content, .hero-card-wrapper, .features-grid, .band-section, .steps-grid, .cta-card, .site-footer';
+        // Every selector that has an html.js pre-reveal (opacity 0) state in style.css.
+        var preReveal = '.hero-content > *, .feature-card, .band-section, .step-card, .cta-card, .reveal, .hero-card-wrapper, .fact-item, .floating-badge, .step-number';
+
+        // Failsafe: content must never stay hidden.
+        function revealAll() {
+            var pending = document.querySelectorAll(preReveal + ', ' + selector);
+            for (var i = 0; i < pending.length; i++) {
+                pending[i].classList.add('revealed');
+            }
+        }
+        setTimeout(revealAll, 1500);
+        // pageshow also fires on first load, so only re-run for back/forward cache restores
+        window.addEventListener('pageshow', function (e) {
+            if (e.persisted) revealAll();
+        });
+
+        var elements = document.querySelectorAll(selector);
+        if (!elements.length) return;
+
+        if (!('IntersectionObserver' in window)) {
+            revealAll();
+            return;
+        }
+
+        var observer = new IntersectionObserver(function (entries) {
+            for (var j = 0; j < entries.length; j++) {
+                var entry = entries[j];
+                if (entry.isIntersecting) {
+                    entry.target.classList.add('revealed');
+                    observer.unobserve(entry.target);
+                }
+            }
+        }, { threshold: 0.1, rootMargin: '0px 0px -40px 0px' });
+
+        for (var k = 0; k < elements.length; k++) {
+            var el = elements[k];
+            if (el.classList.contains('reveal-on-load')) {
+                el.classList.add('revealed');
+            } else {
+                observer.observe(el);
+            }
+        }
+    }
+
     // --- DOM Ready Hook ---
     function onReady() {
         initTheme();
+        initHeaderScroll();
+        initReveals();
         initCopyButtons();
         updateRemainingTime();
         setInterval(updateRemainingTime, 5000);
