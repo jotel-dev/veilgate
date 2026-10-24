@@ -60,7 +60,7 @@ Public invoice references use random 128-bit hexadecimal strings (`public_id`), 
 
 The privacy and payment mechanisms have been verified through automated testing and live on-chain operations:
 
-- **Automated Tests**: 95 automated tests pass (`cargo test`), including injection, CSRF, header, rate-limit, and no-leak tests.
+- **Automated Tests**: the automated test suite passes (`cargo test`), including injection, CSRF, header, rate-limit, and no-leak tests.
 - **Local Test (18 Oct 2026)**: A 0.1 ZEC testnet invoice was paid by a 0.125 TAZ faucet payment and showed Paid with 0.125 received. As a fact about the local test only, database records showed payments per pool column as: orchard: 0, ironwood: 1.
 - **Hosted Test (21 Oct 2026)**: On https://veilgate-demo.onrender.com, a 1.0 ZEC invoice paid by a 1 TAZ faucet payment went from Awaiting payment to Paid about two minutes after the faucet sent the payment, with confirmations set to 1 (observed wall-clock time; it depends on network block time and the scanner's 30-second polling interval).
 - **Faucet Receipt Memo Observation**: Fauzec's page states its payments carry a default receipt memo; as an observation about the faucet used in testing, VeilGate does not read it.
